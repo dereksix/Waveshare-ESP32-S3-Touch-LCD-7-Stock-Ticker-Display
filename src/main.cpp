@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.17"
+#define FIRMWARE_VERSION "1.9.19"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1389,73 +1389,78 @@ void checkGitHubOTA() {
     return;
   }
   
-  updateOTAProgress("Installing firmware...");
+  updateOTAProgress("Downloading firmware...");
   otaInProgress = true;
   
-  Serial.println("Starting writeStream...");
+  // Manual chunked download with progress updates
+  WiFiClient *stream = dlHttp.getStreamPtr();
+  size_t written = 0;
+  uint8_t buff[1024];
+  int lastPercent = 0;
+  unsigned long lastUpdate = millis();
   
-  // Create full-screen black overlay to prevent artifacts
-  lvgl_port_lock(-1);
+  while (dlHttp.connected() && written < contentLength) {
+    size_t available = stream->available();
+    if (available) {
+      size_t toRead = min(available, sizeof(buff));
+      size_t bytesRead = stream->readBytes(buff, toRead);
+      
+      if (bytesRead > 0) {
+        size_t bytesWritten = Update.write(buff, bytesRead);
+        if (bytesWritten != bytesRead) {
+          Serial.printf("Write error: %d vs %d\n", bytesWritten, bytesRead);
+          break;
+        }
+        written += bytesWritten;
+        
+        // Update progress bar every 1% or 500ms
+        int percent = (written * 100) / contentLength;
+        if (percent != lastPercent || millis() - lastUpdate > 500) {
+          lastPercent = percent;
+          lastUpdate = millis();
+          
+          char progressMsg[48];
+          snprintf(progressMsg, sizeof(progressMsg), "Downloading... %d%%  (%d KB)", percent, written / 1024);
+          updateOTAProgress(progressMsg);
+          updateOTAProgressBar(percent);
+          
+          // Give LVGL time to refresh
+          lvgl_port_lock(-1);
+          lv_timer_handler();
+          lvgl_port_unlock();
+        }
+      }
+    } else {
+      delay(1);  // Small delay when no data available
+    }
+    
+    // Timeout check - 60 seconds without progress
+    if (millis() - lastUpdate > 60000) {
+      Serial.println("Download timeout!");
+      break;
+    }
+  }
   
-  // Hide the popup and create a simple full-screen message
-  if (otaProgressPopup) {
+  dlHttp.end();
+  Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
+  
+  if (written == contentLength && Update.end(true)) {
+    updateOTAProgress("Update Complete! Rebooting...");
+    updateOTAProgressBar(100);
+    delay(1500);
+    ESP.restart();
+  } else {
+    char errMsg[48];
+    snprintf(errMsg, sizeof(errMsg), "Update failed: %d/%d bytes", written, contentLength);
+    updateOTAProgress(errMsg);
+    Update.printError(Serial);
+    delay(3000);
+    lvgl_port_lock(-1);
     lv_obj_del(otaProgressPopup);
     otaProgressPopup = nullptr;
     otaProgressLabel = nullptr;
     otaProgressBar = nullptr;
-  }
-  
-  // Create full screen black background
-  lv_obj_t *otaScreen = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(otaScreen, 800, 480);
-  lv_obj_set_pos(otaScreen, 0, 0);
-  lv_obj_set_style_bg_color(otaScreen, lv_color_hex(0x000000), 0);
-  lv_obj_set_style_bg_opa(otaScreen, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(otaScreen, 0, 0);
-  lv_obj_set_style_radius(otaScreen, 0, 0);
-  lv_obj_clear_flag(otaScreen, LV_OBJ_FLAG_SCROLLABLE);
-  
-  // Simple centered message
-  lv_obj_t *otaMsg = lv_label_create(otaScreen);
-  char sizeMsg[64];
-  snprintf(sizeMsg, sizeof(sizeMsg), "Downloading & Installing Update\n\n%d KB\n\nPlease wait...", contentLength / 1024);
-  lv_label_set_text(otaMsg, sizeMsg);
-  lv_obj_set_style_text_font(otaMsg, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(otaMsg, lv_color_hex(0x8B5CF6), 0);
-  lv_obj_set_style_text_align(otaMsg, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(otaMsg);
-  
-  // Force full redraw
-  lv_refr_now(NULL);
-  
-  lvgl_port_unlock();
-  
-  // Small delay to ensure display is updated
-  delay(200);
-  
-  // Use writeStream - this blocks but should work
-  size_t written = Update.writeStream(dlHttp.getStream());
-  
-  Serial.printf("Written: %d bytes\n", written);
-  dlHttp.end();
-  
-  if (written == contentLength && Update.end(true)) {
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaMsg, "Update Complete!\n\nRebooting...");
-    lv_refr_now(NULL);
     lvgl_port_unlock();
-    delay(1000);
-    ESP.restart();
-  } else {
-    char errMsg[48];
-    snprintf(errMsg, sizeof(errMsg), "Update failed!\n\nWrote %d/%d bytes", written, contentLength);
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaMsg, errMsg);
-    lv_refr_now(NULL);
-    lvgl_port_unlock();
-    Update.printError(Serial);
-    delay(3000);
-    ESP.restart();  // Restart anyway to recover
   }
   otaInProgress = false;
 }
