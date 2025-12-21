@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.42"
+#define FIRMWARE_VERSION "1.9.43"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -343,9 +343,11 @@ static void githubOtaTask(void *pv) {
     for (JsonObject asset : assets) {
       String name = asset["name"] | "";
       if (name == "firmware.bin") {
-        firmwareUrl = asset["url"] | "";
+        // Prefer the public browser_download_url for OTA.
+        // The API "url" field points at api.github.com and often requires auth.
+        firmwareUrl = asset["browser_download_url"] | "";
         if (firmwareUrl.length() == 0) {
-          firmwareUrl = asset["browser_download_url"] | "";
+          firmwareUrl = asset["url"] | "";
         }
         break;
       }
@@ -2293,6 +2295,21 @@ void setup() {
 
 void loop() {
   // Don't call lv_timer_handler() - the LVGL task handles it
+
+  // Periodic full-screen invalidate to clear rare stale pixels/artifacts.
+  // Keep it infrequent to avoid tearing and never do it during OTA.
+  static uint32_t lastFullInvalidateMs = 0;
+  const uint32_t FULL_INVALIDATE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+  if (!otaInProgress && githubOtaTaskHandle == nullptr) {
+    uint32_t now = millis();
+    if (lastFullInvalidateMs == 0 || (now - lastFullInvalidateMs) >= FULL_INVALIDATE_INTERVAL_MS) {
+      if (lvgl_port_lock(20)) {
+        lv_obj_invalidate(lv_scr_act());
+        lvgl_port_unlock();
+      }
+      lastFullInvalidateMs = now;
+    }
+  }
 
   // Weekly scheduled OTA (checks + installs at ~3:00 AM local time)
   autoOtaSchedulerTick();
