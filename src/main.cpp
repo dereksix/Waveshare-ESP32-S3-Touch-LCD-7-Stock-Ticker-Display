@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.0"
+#define FIRMWARE_VERSION "1.9.1"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1424,14 +1424,30 @@ void checkGitHubOTA() {
 }
 
 // ============ OTA UPDATE WEB SERVER ============
-const char* otaPage = R"rawliteral(
+const char* otaPagePart1 = R"rawliteral(
 <!DOCTYPE html><html><head><title>Stock Ticker</title>
-<style>body{font-family:Arial;background:#0D1117;color:#C9D1D9;text-align:center;padding:50px}
-h1{color:#58A6FF}input{margin:10px}input[type=submit]{background:#238636;color:#fff;padding:15px 30px;border:none;border-radius:6px;cursor:pointer}</style></head>
-<body><h1>Stock Ticker OTA</h1><p>v)rawliteral" FIRMWARE_VERSION R"rawliteral(</p>
+<style>
+body{font-family:Arial;background:#0D1117;color:#C9D1D9;text-align:center;padding:30px}
+h1{color:#58A6FF;margin-bottom:5px}h2{color:#8B949E;font-size:18px;margin-top:30px}
+.section{background:#161B22;border-radius:10px;padding:20px;margin:15px auto;max-width:400px}
+input[type=text]{background:#0D1117;border:1px solid #30363D;color:#C9D1D9;padding:10px;border-radius:6px;width:250px}
+input[type=file]{margin:10px}
+input[type=submit]{background:#238636;color:#fff;padding:12px 25px;border:none;border-radius:6px;cursor:pointer;margin-top:10px}
+input[type=submit]:hover{background:#2EA043}
+.version{color:#8B949E;font-size:14px}
+</style></head>
+<body><h1>Stock Ticker</h1><p class='version'>v)rawliteral" FIRMWARE_VERSION R"rawliteral(</p>
+<div class='section'><h2>API Key</h2>
+<form method='POST' action='/apikey'>
+<input type='text' name='key' placeholder='Enter TwelveData API Key' value=')rawliteral";
+
+const char* otaPagePart2 = R"rawliteral(' maxlength='32'><br>
+<input type='submit' value='Save API Key'></form></div>
+<div class='section'><h2>Firmware Update</h2>
 <form method='POST' action='/update' enctype='multipart/form-data'>
 <input type='file' name='update' accept='.bin' required><br>
-<input type='submit' value='Upload Firmware'></form></body></html>
+<input type='submit' value='Upload Firmware'></form></div>
+</body></html>
 )rawliteral";
 
 void handleOTAUpload() {
@@ -1462,7 +1478,32 @@ void setupOTA() {
   }
   
   otaServer.on("/", HTTP_GET, []() {
-    otaServer.send(200, "text/html", otaPage);
+    // Build page with current API key (masked)
+    String maskedKey = "";
+    if (apiKey.length() > 4) {
+      maskedKey = apiKey.substring(0, 4) + "****" + apiKey.substring(apiKey.length() - 4);
+    } else if (apiKey.length() > 0) {
+      maskedKey = "****";
+    }
+    String page = String(otaPagePart1) + maskedKey + String(otaPagePart2);
+    otaServer.send(200, "text/html", page);
+  });
+  
+  otaServer.on("/apikey", HTTP_POST, []() {
+    if (otaServer.hasArg("key")) {
+      String newKey = otaServer.arg("key");
+      if (newKey.length() > 0) {
+        apiKey = newKey;
+        Preferences prefs;
+        prefs.begin("stock", false);
+        prefs.putString("apikey", apiKey);
+        prefs.end();
+        Serial.println("API key updated via web");
+        otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>API Key Saved!</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+        return;
+      }
+    }
+    otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#FF5252;text-align:center;padding:50px'><h1>Invalid Key</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
   });
   
   otaServer.on("/update", HTTP_POST, []() {
@@ -1568,18 +1609,19 @@ void setup() {
   // Company name - row 1 (truncate with ... if too long)
   companyNameLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(companyNameLabel, "Loading...");
-  lv_obj_set_style_text_font(companyNameLabel, &lv_font_montserrat_30, 0);
+  lv_obj_set_style_text_font(companyNameLabel, &lv_font_montserrat_36, 0);
   lv_obj_set_style_text_color(companyNameLabel, lv_color_hex(0x8B949E), 0);
   lv_obj_set_width(companyNameLabel, 540);
   lv_label_set_long_mode(companyNameLabel, LV_LABEL_LONG_DOT);
-  lv_obj_align(companyNameLabel, LV_ALIGN_TOP_MID, 70, 10);
+  lv_obj_set_style_text_align(companyNameLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(companyNameLabel, LV_ALIGN_TOP_MID, 70, 8);
   
   // Ticker symbol - row 2
   symbolLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(symbolLabel, currentSymbol.c_str());
-  lv_obj_set_style_text_font(symbolLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(symbolLabel, &lv_font_montserrat_36, 0);
   lv_obj_set_style_text_color(symbolLabel, lv_color_hex(0x58A6FF), 0);
-  lv_obj_align(symbolLabel, LV_ALIGN_TOP_MID, 70, 45);
+  lv_obj_align(symbolLabel, LV_ALIGN_TOP_MID, 70, 50);
   
   // Main price - row 3
   priceLabel = lv_label_create(lv_scr_act());
