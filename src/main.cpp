@@ -62,6 +62,111 @@ lv_obj_t *customSymbolKeyboard = nullptr;
 bool pendingCustomSymbol = false;
 String pendingCustomSymbolStr = "";
 
+// Stock rotation state
+bool rotationEnabled = false;
+String rotationList = "";
+String rotationSymbols[20];
+int rotationCount = 0;
+int rotationIndex = 0;
+uint32_t lastRotationTime = 0;
+int rotationIntervalMins = 5;  // Default 5 minutes
+lv_obj_t *rotationTA = nullptr;
+lv_obj_t *rotationSwitch = nullptr;
+lv_obj_t *rotationKeyboard = nullptr;
+lv_obj_t *rotationPopup = nullptr;
+lv_obj_t *rotationIntervalDropdown = nullptr;
+bool pendingRotation = false;
+
+// Clock display
+lv_obj_t *clockLabel = nullptr;
+
+// Swipe detection state
+static lv_point_t swipeStart;
+static bool swipeTracking = false;
+
+// Cached data for error recovery and market-closed optimization
+struct CachedStockData {
+  bool valid;
+  String symbol;
+  String priceStr;
+  String changeStr;
+  String dollarChangeStr;
+  String ohlStr;
+  String volumeStr;
+  String companyName;
+  float low, high, fiftyTwoLow, fiftyTwoHigh;
+  int dayRangePos, fiftyTwoPos;
+  bool marketOpen;
+  uint32_t fetchTime;  // millis() when data was fetched
+} cachedData = {false};
+
+// Multi-symbol cache for rotation (up to 20 symbols)
+CachedStockData symbolCache[20];
+int symbolCacheCount = 0;
+
+// Find cached data for a symbol
+CachedStockData* findCachedSymbol(const String& symbol) {
+  for (int i = 0; i < symbolCacheCount; i++) {
+    if (symbolCache[i].valid && symbolCache[i].symbol == symbol) {
+      return &symbolCache[i];
+    }
+  }
+  return nullptr;
+}
+
+// Add or update symbol in cache
+void cacheSymbolData(const CachedStockData& data) {
+  // Check if symbol already exists in cache
+  for (int i = 0; i < symbolCacheCount; i++) {
+    if (symbolCache[i].symbol == data.symbol) {
+      symbolCache[i] = data;
+      return;
+    }
+  }
+  // Add new entry if space available
+  if (symbolCacheCount < 20) {
+    symbolCache[symbolCacheCount++] = data;
+  }
+}
+
+// Last time we checked if market reopened (when closed)
+uint32_t lastMarketCheck = 0;
+const uint32_t MARKET_CLOSED_CHECK_INTERVAL = 3600000;  // 1 hour (default)
+const uint32_t MARKET_TRANSITION_CHECK_INTERVAL = 300000;  // 5 minutes (near open/close)
+
+// Check if we're near market open (9:00-10:00 AM ET) or close (3:30-4:30 PM ET)
+bool isNearMarketTransition() {
+  int hours = timeClient.getHours();
+  int mins = timeClient.getMinutes();
+  int totalMins = hours * 60 + mins;
+  
+  // Near market open: 9:00 AM - 10:00 AM ET (540-600 minutes)
+  if (totalMins >= 540 && totalMins <= 600) return true;
+  
+  // Near market close: 3:30 PM - 4:30 PM ET (930-990 minutes)
+  if (totalMins >= 930 && totalMins <= 990) return true;
+  
+  return false;
+}
+
+// Prefetched stock data for smooth transitions
+struct PrefetchedData {
+  bool valid;
+  String symbol;
+  float closePrice;
+  float prevClose;
+  float pctChange;
+  float openPrice;
+  float highPrice;
+  float lowPrice;
+  float volume;
+  float fiftyTwoLow;
+  float fiftyTwoHigh;
+  String companyName;
+  bool marketOpen;
+};
+PrefetchedData prefetchedStock = {false};
+
 // WiFi setup state
 lv_obj_t *wifiPopup = nullptr;
 lv_obj_t *wifiList = nullptr;
@@ -84,6 +189,266 @@ const char* twelvedataKey = TWELVEDATA_API_KEY;
 // Tickers
 const char* tickers[] = {"MSFT", "AAPL", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "SPY", "QQQ"};
 const int numTickers = 9;
+
+// Parse comma-separated rotation list
+void parseRotationList() {
+  rotationCount = 0;
+  if (rotationList.length() == 0) return;
+  
+  String temp = rotationList;
+  temp.trim();
+  temp.toUpperCase();
+  
+  int start = 0;
+  for (int i = 0; i <= temp.length() && rotationCount < 20; i++) {
+    if (i == temp.length() || temp[i] == ',') {
+      String symbol = temp.substring(start, i);
+      symbol.trim();
+      if (symbol.length() > 0 && symbol.length() <= 10) {
+        rotationSymbols[rotationCount++] = symbol;
+      }
+      start = i + 1;
+    }
+  }
+  rotationIndex = 0;
+}
+
+// Prefetch stock data for a symbol (for smooth rotation)
+// Uses cached data when market is closed to save API calls
+bool prefetchStockData(const String& symbol) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  // Check if market is closed and we have cached data for this symbol
+  if (!isMarketOpen) {
+    CachedStockData* cached = findCachedSymbol(symbol);
+    if (cached != nullptr && cached->valid) {
+      // Use cached data - no API call needed!
+      Serial.printf("Market closed - using cached data for %s\n", symbol.c_str());
+      
+      // Convert cached display data back to prefetchedStock
+      // We need to parse the cached strings back to values
+      prefetchedStock.symbol = cached->symbol;
+      prefetchedStock.companyName = cached->companyName;
+      prefetchedStock.lowPrice = cached->low;
+      prefetchedStock.highPrice = cached->high;
+      prefetchedStock.fiftyTwoLow = cached->fiftyTwoLow;
+      prefetchedStock.fiftyTwoHigh = cached->fiftyTwoHigh;
+      prefetchedStock.marketOpen = cached->marketOpen;
+      
+      // Parse price from cached string (e.g., "$485.92")
+      String priceStr = cached->priceStr;
+      priceStr.replace("$", "");
+      priceStr.replace(",", "");
+      prefetchedStock.closePrice = priceStr.toFloat();
+      
+      // Parse percent change from cached string (e.g., "+0.40%" or "-1.23%")
+      String pctStr = cached->changeStr;
+      pctStr.replace("%", "");
+      pctStr.replace("+", "");
+      prefetchedStock.pctChange = pctStr.toFloat();
+      
+      // Parse dollar change (e.g., "+$1.94" or "-$2.50")
+      String dollarStr = cached->dollarChangeStr;
+      dollarStr.replace("$", "");
+      dollarStr.replace("+", "");
+      float dollarChange = dollarStr.toFloat();
+      prefetchedStock.prevClose = prefetchedStock.closePrice - dollarChange;
+      
+      // Parse volume from cached string (e.g., "Vol: 70.82M")
+      String volStr = cached->volumeStr;
+      volStr.replace("Vol: ", "");
+      float volMult = 1.0;
+      if (volStr.endsWith("B")) { volMult = 1000000000.0; volStr.replace("B", ""); }
+      else if (volStr.endsWith("M")) { volMult = 1000000.0; volStr.replace("M", ""); }
+      else if (volStr.endsWith("K")) { volMult = 1000.0; volStr.replace("K", ""); }
+      prefetchedStock.volume = volStr.toFloat() * volMult;
+      
+      // Parse open price from OHL string (e.g., "O: 487.36  H: 487.85  L: 482.49")
+      String ohlStr = cached->ohlStr;
+      int oIdx = ohlStr.indexOf("O: ");
+      int hIdx = ohlStr.indexOf("H: ");
+      if (oIdx >= 0 && hIdx > oIdx) {
+        prefetchedStock.openPrice = ohlStr.substring(oIdx + 3, hIdx).toFloat();
+      }
+      
+      prefetchedStock.valid = true;
+      return true;
+    }
+    // No cached data - need to fetch once even when closed
+    Serial.printf("Market closed but no cache for %s - fetching once\n", symbol.c_str());
+  }
+  
+  HTTPClient http;
+  String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + twelvedataKey;
+  
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    
+    prefetchedStock.symbol = symbol;
+    prefetchedStock.closePrice = 0.0;
+    prefetchedStock.prevClose = 0.0;
+    prefetchedStock.pctChange = 0.0;
+    prefetchedStock.openPrice = 0.0;
+    prefetchedStock.highPrice = 0.0;
+    prefetchedStock.lowPrice = 0.0;
+    prefetchedStock.volume = 0.0;
+    prefetchedStock.fiftyTwoLow = 0.0;
+    prefetchedStock.fiftyTwoHigh = 0.0;
+    prefetchedStock.companyName = "";
+    prefetchedStock.marketOpen = false;
+    
+    if (doc["close"].is<const char*>()) prefetchedStock.closePrice = atof(doc["close"].as<const char*>());
+    if (doc["previous_close"].is<const char*>()) prefetchedStock.prevClose = atof(doc["previous_close"].as<const char*>());
+    if (doc["percent_change"].is<const char*>()) prefetchedStock.pctChange = atof(doc["percent_change"].as<const char*>());
+    if (doc["open"].is<const char*>()) prefetchedStock.openPrice = atof(doc["open"].as<const char*>());
+    if (doc["high"].is<const char*>()) prefetchedStock.highPrice = atof(doc["high"].as<const char*>());
+    if (doc["low"].is<const char*>()) prefetchedStock.lowPrice = atof(doc["low"].as<const char*>());
+    if (doc["volume"].is<const char*>()) prefetchedStock.volume = atof(doc["volume"].as<const char*>());
+    if (doc["name"].is<const char*>()) prefetchedStock.companyName = doc["name"].as<const char*>();
+    if (doc["is_market_open"].is<bool>()) prefetchedStock.marketOpen = doc["is_market_open"].as<bool>();
+    if (doc["fifty_two_week"]["low"].is<const char*>()) 
+      prefetchedStock.fiftyTwoLow = atof(doc["fifty_two_week"]["low"].as<const char*>());
+    if (doc["fifty_two_week"]["high"].is<const char*>()) 
+      prefetchedStock.fiftyTwoHigh = atof(doc["fifty_two_week"]["high"].as<const char*>());
+    
+    // Update global market status
+    isMarketOpen = prefetchedStock.marketOpen;
+    
+    prefetchedStock.valid = true;
+    http.end();
+    return true;
+  }
+  
+  http.end();
+  prefetchedStock.valid = false;
+  return false;
+}
+
+// Apply prefetched data to UI (call with LVGL lock held)
+void applyPrefetchedData() {
+  if (!prefetchedStock.valid) return;
+  
+  currentSymbol = prefetchedStock.symbol;
+  float closePrice = prefetchedStock.closePrice;
+  float pctChange = prefetchedStock.pctChange;
+  float dollarChange = closePrice - prefetchedStock.prevClose;
+  
+  // Format strings
+  char priceBuf[16], pctBuf[16], dollarBuf[16];
+  snprintf(priceBuf, sizeof(priceBuf), "$%.2f", closePrice);
+  snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", pctChange);
+  snprintf(dollarBuf, sizeof(dollarBuf), "%+.2f", dollarChange);
+  
+  char ohlBuf[48];
+  snprintf(ohlBuf, sizeof(ohlBuf), "O: %.2f   H: %.2f   L: %.2f", 
+           prefetchedStock.openPrice, prefetchedStock.highPrice, prefetchedStock.lowPrice);
+  
+  char volBuf[24];
+  float volume = prefetchedStock.volume;
+  if (volume >= 1e9) snprintf(volBuf, sizeof(volBuf), "Vol: %.2fB", volume / 1e9);
+  else if (volume >= 1e6) snprintf(volBuf, sizeof(volBuf), "Vol: %.2fM", volume / 1e6);
+  else if (volume >= 1e3) snprintf(volBuf, sizeof(volBuf), "Vol: %.1fK", volume / 1e3);
+  else snprintf(volBuf, sizeof(volBuf), "Vol: %.0f", volume);
+  
+  // Range calculations
+  int rangePos = 50;
+  if (prefetchedStock.highPrice > prefetchedStock.lowPrice) {
+    rangePos = (int)(((closePrice - prefetchedStock.lowPrice) / (prefetchedStock.highPrice - prefetchedStock.lowPrice)) * 100);
+    if (rangePos < 0) rangePos = 0;
+    if (rangePos > 100) rangePos = 100;
+  }
+  
+  int fiftyTwoPos = 50;
+  if (prefetchedStock.fiftyTwoHigh > prefetchedStock.fiftyTwoLow) {
+    fiftyTwoPos = (int)(((closePrice - prefetchedStock.fiftyTwoLow) / (prefetchedStock.fiftyTwoHigh - prefetchedStock.fiftyTwoLow)) * 100);
+    if (fiftyTwoPos < 0) fiftyTwoPos = 0;
+    if (fiftyTwoPos > 100) fiftyTwoPos = 100;
+  }
+  
+  char lowBuf[12], highBuf[12];
+  snprintf(lowBuf, sizeof(lowBuf), "%.2f", prefetchedStock.lowPrice);
+  snprintf(highBuf, sizeof(highBuf), "%.2f", prefetchedStock.highPrice);
+  
+  char fiftyTwoLowBuf[12], fiftyTwoHighBuf[12];
+  snprintf(fiftyTwoLowBuf, sizeof(fiftyTwoLowBuf), "%.2f", prefetchedStock.fiftyTwoLow);
+  snprintf(fiftyTwoHighBuf, sizeof(fiftyTwoHighBuf), "%.2f", prefetchedStock.fiftyTwoHigh);
+  
+  // Update symbol with company name
+  char symbolWithName[80];
+  if (prefetchedStock.companyName.length() > 0) {
+    snprintf(symbolWithName, sizeof(symbolWithName), "%s - $%s", prefetchedStock.companyName.c_str(), currentSymbol.c_str());
+  } else {
+    snprintf(symbolWithName, sizeof(symbolWithName), "$%s", currentSymbol.c_str());
+  }
+  lv_label_set_text(symbolLabel, symbolWithName);
+  
+  lv_label_set_text(priceLabel, priceBuf);
+  lv_label_set_text(changeLabel, pctBuf);
+  lv_label_set_text(dollarChangeLabel, dollarBuf);
+  lv_label_set_text(ohlLabel, ohlBuf);
+  lv_label_set_text(volumeLabel, volBuf);
+  lv_label_set_text(rangeLowLabel, lowBuf);
+  lv_label_set_text(rangeHighLabel, highBuf);
+  lv_bar_set_value(rangeBar, rangePos, LV_ANIM_OFF);
+  
+  lv_color_t changeColor = pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252);
+  
+  lv_label_set_text(trendArrow, pctChange >= 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+  lv_obj_set_style_text_color(trendArrow, changeColor, 0);
+  lv_obj_set_style_border_color(trendPanel, changeColor, 0);
+  
+  lv_label_set_text(fiftyTwoWeekLowLabel, fiftyTwoLowBuf);
+  lv_label_set_text(fiftyTwoWeekHighLabel, fiftyTwoHighBuf);
+  lv_bar_set_value(fiftyTwoWeekBar, fiftyTwoPos, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(fiftyTwoWeekBar, changeColor, LV_PART_INDICATOR);
+  
+  lv_label_set_text(marketStatusLabel, prefetchedStock.marketOpen ? "Market Open" : "Market Closed");
+  lv_obj_set_style_text_color(marketStatusLabel, 
+    prefetchedStock.marketOpen ? lv_color_hex(0x00E676) : lv_color_hex(0xFF9800), 0);
+  
+  isMarketOpen = prefetchedStock.marketOpen;
+  
+  lv_obj_set_style_text_color(changeLabel, changeColor, 0);
+  lv_obj_set_style_text_color(dollarChangeLabel, changeColor, 0);
+  lv_obj_set_style_bg_color(rangeBar, changeColor, LV_PART_INDICATOR);
+  
+  timeClient.update();
+  int hour = timeClient.getHours();
+  int minute = timeClient.getMinutes();
+  char timeBuf[64];
+  int hour12 = hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  snprintf(timeBuf, sizeof(timeBuf), "Last Updated: %d:%02d %s  |  $MSFT Money Team", hour12, minute, hour >= 12 ? "PM" : "AM");
+  lv_label_set_text(statusLabel, timeBuf);
+  
+  // Cache this data for rotation when market closed
+  CachedStockData newCache;
+  newCache.valid = true;
+  newCache.symbol = currentSymbol;
+  newCache.priceStr = priceBuf;
+  newCache.changeStr = pctBuf;
+  newCache.dollarChangeStr = dollarBuf;
+  newCache.ohlStr = ohlBuf;
+  newCache.volumeStr = volBuf;
+  newCache.companyName = prefetchedStock.companyName;
+  newCache.low = prefetchedStock.lowPrice;
+  newCache.high = prefetchedStock.highPrice;
+  newCache.fiftyTwoLow = prefetchedStock.fiftyTwoLow;
+  newCache.fiftyTwoHigh = prefetchedStock.fiftyTwoHigh;
+  newCache.dayRangePos = rangePos;
+  newCache.fiftyTwoPos = fiftyTwoPos;
+  newCache.marketOpen = prefetchedStock.marketOpen;
+  newCache.fetchTime = millis();
+  cacheSymbolData(newCache);
+  
+  prefetchedStock.valid = false;  // Mark as consumed
+}
 
 void fetchPrice() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -248,13 +613,39 @@ void fetchPrice() {
       lvgl_port_unlock();
     }
     
+    // Cache this data for error recovery AND multi-symbol rotation cache
+    cachedData.valid = true;
+    cachedData.symbol = currentSymbol;
+    cachedData.priceStr = priceBuf;
+    cachedData.changeStr = pctBuf;
+    cachedData.dollarChangeStr = dollarBuf;
+    cachedData.ohlStr = ohlBuf;
+    cachedData.volumeStr = volBuf;
+    cachedData.companyName = companyName;
+    cachedData.low = lowPrice;
+    cachedData.high = highPrice;
+    cachedData.fiftyTwoLow = fiftyTwoLow;
+    cachedData.fiftyTwoHigh = fiftyTwoHigh;
+    cachedData.dayRangePos = rangePos;
+    cachedData.fiftyTwoPos = fiftyTwoPos;
+    cachedData.marketOpen = apiMarketOpen;
+    cachedData.fetchTime = millis();
+    
+    // Also add to multi-symbol cache for rotation
+    cacheSymbolData(cachedData);
+    
     prefs.begin("stock", false);
     prefs.putString("symbol", currentSymbol);
     prefs.putString("price", lastPrice);
     prefs.end();
   } else {
+    // API error - show cached data if available
     if (lvgl_port_lock(100)) {
-      lv_label_set_text(statusLabel, "API Error");
+      if (cachedData.valid && cachedData.symbol == currentSymbol) {
+        lv_label_set_text(statusLabel, "Cached (API Error)");
+      } else {
+        lv_label_set_text(statusLabel, "API Error");
+      }
       lv_obj_invalidate(statusLabel);
       lvgl_port_unlock();
     }
@@ -318,6 +709,9 @@ static void custom_symbol_ta_cb(lv_event_t *e) {
   if (code == LV_EVENT_FOCUSED) {
     if (customSymbolKeyboard) {
       lv_obj_clear_flag(customSymbolKeyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (rotationKeyboard) {
+      lv_obj_add_flag(rotationKeyboard, LV_OBJ_FLAG_HIDDEN);
     }
   } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
     if (customSymbolKeyboard) {
@@ -574,6 +968,150 @@ void createSettingsPopup() {
   lv_obj_center(goLbl);
   lv_obj_add_event_cb(goBtn, custom_symbol_go_cb, LV_EVENT_CLICKED, NULL);
   
+  // ===== Stock Rotation Button =====
+  lv_obj_t *rotateBtn = lv_btn_create(settingsPopup);
+  lv_obj_set_size(rotateBtn, 180, 50);
+  lv_obj_set_pos(rotateBtn, 480, 145);
+  lv_obj_set_style_bg_color(rotateBtn, lv_color_hex(0x444444), 0);
+  lv_obj_t *rotateBtnLbl = lv_label_create(rotateBtn);
+  lv_label_set_text(rotateBtnLbl, LV_SYMBOL_REFRESH " Rotation...");
+  lv_obj_set_style_text_font(rotateBtnLbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(rotateBtnLbl);
+  lv_obj_add_event_cb(rotateBtn, [](lv_event_t *e) {
+    // Create rotation sub-popup (nearly full screen)
+    rotationPopup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(rotationPopup, 760, 440);
+    lv_obj_center(rotationPopup);
+    lv_obj_set_style_bg_color(rotationPopup, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(rotationPopup, lv_color_hex(0x0088FF), 0);
+    lv_obj_set_style_border_width(rotationPopup, 2, 0);
+    lv_obj_set_style_radius(rotationPopup, 15, 0);
+    lv_obj_clear_flag(rotationPopup, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(rotationPopup);
+    lv_label_set_text(title, "Stock Rotation Settings");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    
+    // Enable toggle
+    lv_obj_t *enableLabel = lv_label_create(rotationPopup);
+    lv_label_set_text(enableLabel, "Enable:");
+    lv_obj_set_style_text_font(enableLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(enableLabel, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_pos(enableLabel, 40, 55);
+    
+    rotationSwitch = lv_switch_create(rotationPopup);
+    lv_obj_set_size(rotationSwitch, 70, 35);
+    lv_obj_set_pos(rotationSwitch, 130, 50);
+    if (rotationEnabled) lv_obj_add_state(rotationSwitch, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(rotationSwitch, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(rotationSwitch, lv_color_hex(0x00AA00), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(rotationSwitch, [](lv_event_t *e) {
+      rotationEnabled = lv_obj_has_state(rotationSwitch, LV_STATE_CHECKED);
+      prefs.begin("stock", false);
+      prefs.putBool("rotate_on", rotationEnabled);
+      prefs.end();
+      if (rotationEnabled) {
+        parseRotationList();
+        lastRotationTime = millis();
+      }
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    // Interval dropdown
+    lv_obj_t *intervalLabel = lv_label_create(rotationPopup);
+    lv_label_set_text(intervalLabel, "Interval:");
+    lv_obj_set_style_text_font(intervalLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(intervalLabel, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_pos(intervalLabel, 280, 55);
+    
+    rotationIntervalDropdown = lv_dropdown_create(rotationPopup);
+    lv_dropdown_set_options(rotationIntervalDropdown, "1 min\n2 min\n5 min\n10 min");
+    // Set selected based on current interval
+    int selectedIdx = 2;  // Default to 5 min
+    if (rotationIntervalMins == 1) selectedIdx = 0;
+    else if (rotationIntervalMins == 2) selectedIdx = 1;
+    else if (rotationIntervalMins == 5) selectedIdx = 2;
+    else if (rotationIntervalMins == 10) selectedIdx = 3;
+    lv_dropdown_set_selected(rotationIntervalDropdown, selectedIdx);
+    lv_obj_set_size(rotationIntervalDropdown, 120, 40);
+    lv_obj_set_pos(rotationIntervalDropdown, 370, 48);
+    lv_obj_set_style_bg_color(rotationIntervalDropdown, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_text_color(rotationIntervalDropdown, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_color(rotationIntervalDropdown, lv_color_hex(0x0088FF), 0);
+    lv_obj_add_event_cb(rotationIntervalDropdown, [](lv_event_t *e) {
+      int sel = lv_dropdown_get_selected(rotationIntervalDropdown);
+      int intervals[] = {1, 2, 5, 10};
+      rotationIntervalMins = intervals[sel];
+      prefs.begin("stock", false);
+      prefs.putInt("rotate_int", rotationIntervalMins);
+      prefs.end();
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    // Stock list label
+    lv_obj_t *listLabel = lv_label_create(rotationPopup);
+    lv_label_set_text(listLabel, "Stocks (comma separated):");
+    lv_obj_set_style_text_font(listLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(listLabel, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_pos(listLabel, 40, 100);
+    
+    // Text area for stocks - wider
+    rotationTA = lv_textarea_create(rotationPopup);
+    lv_obj_set_size(rotationTA, 680, 50);
+    lv_obj_set_pos(rotationTA, 40, 130);
+    lv_textarea_set_one_line(rotationTA, true);
+    lv_textarea_set_max_length(rotationTA, 200);
+    lv_textarea_set_placeholder_text(rotationTA, "AAPL, MSFT, NVDA, GOOG, TSLA, AMZN, META");
+    if (rotationList.length() > 0) lv_textarea_set_text(rotationTA, rotationList.c_str());
+    lv_obj_set_style_bg_color(rotationTA, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_text_color(rotationTA, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(rotationTA, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_border_color(rotationTA, lv_color_hex(0x0088FF), 0);
+    lv_obj_add_event_cb(rotationTA, [](lv_event_t *e) {
+      lv_event_code_t code = lv_event_get_code(e);
+      if (code == LV_EVENT_FOCUSED) {
+        if (rotationKeyboard) lv_obj_clear_flag(rotationKeyboard, LV_OBJ_FLAG_HIDDEN);
+      } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        if (rotationKeyboard) lv_obj_add_flag(rotationKeyboard, LV_OBJ_FLAG_HIDDEN);
+      }
+    }, LV_EVENT_ALL, NULL);
+    
+    // Keyboard at bottom of popup - full width
+    rotationKeyboard = lv_keyboard_create(rotationPopup);
+    lv_obj_set_size(rotationKeyboard, 720, 180);
+    lv_obj_align(rotationKeyboard, LV_ALIGN_BOTTOM_MID, 0, -55);
+    lv_keyboard_set_textarea(rotationKeyboard, rotationTA);
+    lv_obj_add_flag(rotationKeyboard, LV_OBJ_FLAG_HIDDEN);
+    
+    // Save & Close button
+    lv_obj_t *saveBtn = lv_btn_create(rotationPopup);
+    lv_obj_set_size(saveBtn, 160, 50);
+    lv_obj_align(saveBtn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(saveBtn, lv_color_hex(0x00AA00), 0);
+    lv_obj_t *saveLbl = lv_label_create(saveBtn);
+    lv_label_set_text(saveLbl, LV_SYMBOL_OK " Save");
+    lv_obj_set_style_text_font(saveLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(saveLbl);
+    lv_obj_add_event_cb(saveBtn, [](lv_event_t *e) {
+      // Save the rotation list
+      rotationList = String(lv_textarea_get_text(rotationTA));
+      prefs.begin("stock", false);
+      prefs.putString("rotate_list", rotationList);
+      prefs.end();
+      parseRotationList();
+      // Close popup
+      if (rotationPopup) {
+        lv_obj_del(rotationPopup);
+        rotationPopup = nullptr;
+        rotationTA = nullptr;
+        rotationSwitch = nullptr;
+        rotationKeyboard = nullptr;
+        lv_obj_invalidate(lv_scr_act());  // Force screen refresh
+      }
+    }, LV_EVENT_CLICKED, NULL);
+  }, LV_EVENT_CLICKED, NULL);
+  
   // Keyboard (hidden initially, spans full width at bottom)
   customSymbolKeyboard = lv_keyboard_create(settingsPopup);
   lv_obj_set_size(customSymbolKeyboard, 660, 180);
@@ -793,7 +1331,14 @@ void setup() {
   lv_label_set_text(marketStatusLabel, "Market Closed");
   lv_obj_set_style_text_font(marketStatusLabel, &lv_font_montserrat_26, 0);
   lv_obj_set_style_text_color(marketStatusLabel, lv_color_hex(0xFF9800), 0);
-  lv_obj_align(marketStatusLabel, LV_ALIGN_TOP_MID, 70, 345);
+  lv_obj_align(marketStatusLabel, LV_ALIGN_TOP_MID, 70, 340);
+  
+  // Clock display - upper left, subtle
+  clockLabel = lv_label_create(lv_scr_act());
+  lv_label_set_text(clockLabel, "--:-- --");
+  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(clockLabel, lv_color_hex(0x8B949E), 0);
+  lv_obj_align(clockLabel, LV_ALIGN_TOP_LEFT, 15, 12);
   
   // ===== Bottom status bar =====
   // WiFi icon - far left
@@ -810,20 +1355,52 @@ void setup() {
   lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x8B949E), 0);
   lv_obj_align(statusLabel, LV_ALIGN_BOTTOM_LEFT, 35, -16);
   
-  // Settings button
+  // Settings button (smaller)
   lv_obj_t *settingsBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(settingsBtn, 130, 45);
-  lv_obj_align(settingsBtn, LV_ALIGN_BOTTOM_RIGHT, -25, -20);
+  lv_obj_set_size(settingsBtn, 100, 38);
+  lv_obj_align(settingsBtn, LV_ALIGN_BOTTOM_RIGHT, -15, -12);
   lv_obj_set_style_bg_color(settingsBtn, lv_color_hex(0x21262D), 0);
   lv_obj_set_style_border_color(settingsBtn, lv_color_hex(0x30363D), 0);
   lv_obj_set_style_border_width(settingsBtn, 1, 0);
   lv_obj_set_style_radius(settingsBtn, 8, 0);
   lv_obj_t *settingsLbl = lv_label_create(settingsBtn);
-  lv_label_set_text(settingsLbl, LV_SYMBOL_SETTINGS " Settings");
-  lv_obj_set_style_text_font(settingsLbl, &lv_font_montserrat_14, 0);
+  lv_label_set_text(settingsLbl, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_font(settingsLbl, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(settingsLbl, lv_color_hex(0xC9D1D9), 0);
   lv_obj_center(settingsLbl);
   lv_obj_add_event_cb(settingsBtn, open_settings_cb, LV_EVENT_CLICKED, NULL);
+  
+  // Add swipe detection to main screen
+  lv_obj_add_event_cb(lv_scr_act(), [](lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+      lv_indev_t *indev = lv_indev_get_act();
+      if (indev) {
+        lv_indev_get_point(indev, &swipeStart);
+        swipeTracking = true;
+      }
+    } else if (code == LV_EVENT_RELEASED && swipeTracking) {
+      swipeTracking = false;
+      lv_indev_t *indev = lv_indev_get_act();
+      if (indev && rotationEnabled && rotationCount > 1 && settingsPopup == nullptr) {
+        lv_point_t swipeEnd;
+        lv_indev_get_point(indev, &swipeEnd);
+        int dx = swipeEnd.x - swipeStart.x;
+        if (abs(dx) > 100) {  // Minimum swipe distance
+          if (dx < 0) {
+            // Swipe left - next stock
+            rotationIndex = (rotationIndex + 1) % rotationCount;
+          } else {
+            // Swipe right - previous stock
+            rotationIndex = (rotationIndex - 1 + rotationCount) % rotationCount;
+          }
+          currentSymbol = rotationSymbols[rotationIndex];
+          lastRotationTime = millis();  // Reset rotation timer
+          pendingFetch = true;
+        }
+      }
+    }
+  }, LV_EVENT_ALL, NULL);
   
   lvgl_port_unlock();
   
@@ -867,6 +1444,22 @@ void setup() {
         lvgl_port_unlock();
       }
       timeClient.begin();
+      
+      // Load rotation settings
+      prefs.begin("stock", true);
+      rotationEnabled = prefs.getBool("rotate_on", false);
+      rotationList = prefs.getString("rotate_list", "");
+      rotationIntervalMins = prefs.getInt("rotate_int", 5);
+      prefs.end();
+      parseRotationList();
+      lastRotationTime = millis();
+      
+      // If rotation enabled, start with first symbol
+      if (rotationEnabled && rotationCount > 0) {
+        currentSymbol = rotationSymbols[0];
+        rotationIndex = 0;
+      }
+      
       fetchPrice();
     } else {
       if (lvgl_port_lock(100)) {
@@ -904,11 +1497,19 @@ void loop() {
       
       if (pendingClosePopup) {
         pendingClosePopup = false;
+        // First close rotation popup if open
+        if (rotationPopup != nullptr) {
+          lv_obj_del(rotationPopup);
+          rotationPopup = nullptr;
+        }
         if (settingsPopup != nullptr) {
           lv_obj_del(settingsPopup);
           settingsPopup = nullptr;
           customSymbolTA = nullptr;
           customSymbolKeyboard = nullptr;
+          rotationTA = nullptr;
+          rotationSwitch = nullptr;
+          rotationKeyboard = nullptr;
           lv_obj_invalidate(lv_scr_act());  // Force full screen refresh
         }
       }
@@ -1016,12 +1617,104 @@ void loop() {
     }
   }
   
-  // Periodic refresh - only when market is open
+  // Stock rotation - based on user-selected interval
+  if (rotationEnabled && rotationCount > 1 && settingsPopup == nullptr) {
+    uint32_t intervalMs = (uint32_t)rotationIntervalMins * 60000;
+    if (millis() - lastRotationTime > intervalMs) {
+      lastRotationTime = millis();
+      int nextIndex = (rotationIndex + 1) % rotationCount;
+      String nextSymbol = rotationSymbols[nextIndex];
+      
+      // Prefetch the next stock's data BEFORE visual transition
+      Serial.printf("Prefetching data for %s...\n", nextSymbol.c_str());
+      bool fetched = prefetchStockData(nextSymbol);
+      
+      if (fetched) {
+        rotationIndex = nextIndex;
+        
+        // Now do smooth visual transition with data ready
+        if (lvgl_port_lock(100)) {
+          // Fade out
+          lv_obj_set_style_opa(priceLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(symbolLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(changeLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(dollarChangeLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(ohlLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(volumeLabel, LV_OPA_0, 0);
+          lvgl_port_unlock();
+        }
+        
+        delay(100);  // Brief fade out
+        
+        // Apply prefetched data and fade in
+        if (lvgl_port_lock(100)) {
+          applyPrefetchedData();  // Paint all data at once
+          
+          // Fade back in
+          lv_obj_set_style_opa(priceLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(symbolLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(changeLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(dollarChangeLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(ohlLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(volumeLabel, LV_OPA_COVER, 0);
+          lv_obj_invalidate(lv_scr_act());
+          lvgl_port_unlock();
+        }
+        Serial.printf("Rotated to %s\n", nextSymbol.c_str());
+      } else {
+        Serial.println("Prefetch failed, skipping rotation");
+      }
+    }
+  }
+  
+  // Periodic refresh logic
   static uint32_t lastCheck = 0;
-  if (millis() - lastCheck > 300000) {  // 5 minutes
-    lastCheck = millis();
-    if (WiFi.status() == WL_CONNECTED && isMarketOpen) {
-      fetchPrice();
+  uint32_t now = millis();
+  
+  if (isMarketOpen) {
+    // Market open: refresh every 5 minutes
+    if (now - lastCheck > 300000) {
+      lastCheck = now;
+      if (WiFi.status() == WL_CONNECTED && !rotationEnabled) {
+        fetchPrice();
+      }
+    }
+  } else {
+    // Market closed: smart check interval
+    // - Every 5 minutes near market open (9:00-10:00 AM) or close (3:30-4:30 PM)
+    // - Every hour otherwise (nights/weekends)
+    uint32_t checkInterval = isNearMarketTransition() ? MARKET_TRANSITION_CHECK_INTERVAL : MARKET_CLOSED_CHECK_INTERVAL;
+    
+    if (now - lastMarketCheck > checkInterval) {
+      lastMarketCheck = now;
+      if (WiFi.status() == WL_CONNECTED) {
+        if (isNearMarketTransition()) {
+          Serial.println("Near market transition - checking every 5 min");
+        } else {
+          Serial.println("Market closed - hourly check");
+        }
+        fetchPrice();  // This will update isMarketOpen if market opened
+      }
+    }
+  }
+  
+  // Update clock display every second
+  static uint32_t lastClockUpdate = 0;
+  if (millis() - lastClockUpdate > 1000) {
+    lastClockUpdate = millis();
+    if (WiFi.status() == WL_CONNECTED && clockLabel) {
+      timeClient.update();
+      int hours = timeClient.getHours();
+      int mins = timeClient.getMinutes();
+      const char* ampm = hours >= 12 ? "PM" : "AM";
+      hours = hours % 12;
+      if (hours == 0) hours = 12;
+      char clockBuf[16];
+      snprintf(clockBuf, sizeof(clockBuf), "%d:%02d %s", hours, mins, ampm);
+      if (lvgl_port_lock(50)) {
+        lv_label_set_text(clockLabel, clockBuf);
+        lvgl_port_unlock();
+      }
     }
   }
   
