@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.15"
+#define FIRMWARE_VERSION "1.9.17"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1394,17 +1394,44 @@ void checkGitHubOTA() {
   
   Serial.println("Starting writeStream...");
   
-  // Simple approach - use writeStream 
-  // First, show download is starting
-  char sizeMsg[48];
-  snprintf(sizeMsg, sizeof(sizeMsg), "Downloading %d KB...", contentLength / 1024);
-  updateOTAProgress(sizeMsg);
-  
-  // Give LVGL a chance to show the message
+  // Create full-screen black overlay to prevent artifacts
   lvgl_port_lock(-1);
-  lv_timer_handler();
+  
+  // Hide the popup and create a simple full-screen message
+  if (otaProgressPopup) {
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+  }
+  
+  // Create full screen black background
+  lv_obj_t *otaScreen = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(otaScreen, 800, 480);
+  lv_obj_set_pos(otaScreen, 0, 0);
+  lv_obj_set_style_bg_color(otaScreen, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(otaScreen, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(otaScreen, 0, 0);
+  lv_obj_set_style_radius(otaScreen, 0, 0);
+  lv_obj_clear_flag(otaScreen, LV_OBJ_FLAG_SCROLLABLE);
+  
+  // Simple centered message
+  lv_obj_t *otaMsg = lv_label_create(otaScreen);
+  char sizeMsg[64];
+  snprintf(sizeMsg, sizeof(sizeMsg), "Downloading & Installing Update\n\n%d KB\n\nPlease wait...", contentLength / 1024);
+  lv_label_set_text(otaMsg, sizeMsg);
+  lv_obj_set_style_text_font(otaMsg, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(otaMsg, lv_color_hex(0x8B5CF6), 0);
+  lv_obj_set_style_text_align(otaMsg, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(otaMsg);
+  
+  // Force full redraw
+  lv_refr_now(NULL);
+  
   lvgl_port_unlock();
-  delay(100);
+  
+  // Small delay to ensure display is updated
+  delay(200);
   
   // Use writeStream - this blocks but should work
   size_t written = Update.writeStream(dlHttp.getStream());
@@ -1413,24 +1440,22 @@ void checkGitHubOTA() {
   dlHttp.end();
   
   if (written == contentLength && Update.end(true)) {
-    updateOTAProgress("Update complete! Rebooting...");
     lvgl_port_lock(-1);
-    lv_timer_handler();
+    lv_label_set_text(otaMsg, "Update Complete!\n\nRebooting...");
+    lv_refr_now(NULL);
     lvgl_port_unlock();
     delay(1000);
     ESP.restart();
   } else {
     char errMsg[48];
-    snprintf(errMsg, sizeof(errMsg), "Update failed! Wrote %d/%d", written, contentLength);
-    updateOTAProgress(errMsg);
+    snprintf(errMsg, sizeof(errMsg), "Update failed!\n\nWrote %d/%d bytes", written, contentLength);
+    lvgl_port_lock(-1);
+    lv_label_set_text(otaMsg, errMsg);
+    lv_refr_now(NULL);
+    lvgl_port_unlock();
     Update.printError(Serial);
     delay(3000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
+    ESP.restart();  // Restart anyway to recover
   }
   otaInProgress = false;
 }
