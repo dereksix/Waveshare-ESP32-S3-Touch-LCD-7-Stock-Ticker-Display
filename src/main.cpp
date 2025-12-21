@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.45"
+#define FIRMWARE_VERSION "1.9.51"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -655,6 +655,25 @@ uint32_t lastMarketCheck = 0;
 const uint32_t MARKET_CLOSED_CHECK_INTERVAL = 3600000;  // 1 hour (default)
 const uint32_t MARKET_TRANSITION_CHECK_INTERVAL = 300000;  // 5 minutes (near open/close)
 
+// Approximate regular US market hours in local device time (expected ET):
+// Mon-Fri, 9:30 AM - 4:00 PM.
+// Used to make caching decisions even if the last API-reported market state is stale
+// (e.g., rotation enabled disables periodic fetches).
+static bool isRegularMarketHoursByTime() {
+  // Keep time reasonably fresh; OK if update fails.
+  timeClient.update();
+
+  int day = timeClient.getDay();  // 0=Sunday .. 6=Saturday
+  if (day == 0 || day == 6) return false;
+
+  int hours = timeClient.getHours();
+  int mins = timeClient.getMinutes();
+  int totalMins = hours * 60 + mins;
+
+  // 9:30 AM (570) .. 4:00 PM (960)
+  return (totalMins >= 570 && totalMins <= 960);
+}
+
 // Check if we're near market open (9:00-10:00 AM ET) or close (3:30-4:30 PM ET)
 bool isNearMarketTransition() {
   int hours = timeClient.getHours();
@@ -738,13 +757,20 @@ void parseRotationList() {
 // Uses cached data when market is closed to save API calls
 bool prefetchStockData(const String& symbol) {
   if (WiFi.status() != WL_CONNECTED) return false;
-  
+
+  // If rotation is enabled, we may not be calling fetchPrice() periodically.
+  // That can leave isMarketOpen stale (e.g., stuck true after the close).
+  // Treat the market as "closed" for caching purposes when either:
+  // - The API last told us it's closed, OR
+  // - The local time is outside regular market hours.
+  bool treatAsClosedForCache = (!isMarketOpen) || (!isRegularMarketHoursByTime());
+
   // Check if market is closed and we have cached data for this symbol
-  if (!isMarketOpen) {
+  if (treatAsClosedForCache) {
     CachedStockData* cached = findCachedSymbol(symbol);
     if (cached != nullptr && cached->valid) {
       // Use cached data - no API call needed!
-      Serial.printf("Market closed - using cached data for %s\n", symbol.c_str());
+      Serial.printf("Market closed (cache) - using cached data for %s\n", symbol.c_str());
       
       // Convert cached display data back to prefetchedStock
       // We need to parse the cached strings back to values
@@ -1930,6 +1956,24 @@ void setup() {
   
   Board *board = new Board();
   board->init();
+
+#if LVGL_PORT_AVOID_TEARING_MODE
+  // When avoid tearing is enabled, set the frame buffer number before `begin()`.
+  // On ESP32-S3 RGB panels, the bounce buffer greatly improves long-run stability.
+  {
+    auto *lcd_pre = board->getLCD();
+    if (lcd_pre) {
+      lcd_pre->configFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
+
+#if ESP_PANEL_DRIVERS_BUS_ENABLE_RGB && defined(CONFIG_IDF_TARGET_ESP32S3)
+      auto *lcd_bus = lcd_pre->getBus();
+      if (lcd_bus && lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
+        static_cast<esp_panel::drivers::BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd_pre->getFrameWidth() * 10);
+      }
+#endif
+    }
+  }
+#endif
   board->begin();
   
   auto *lcd = board->getLCD();
@@ -2604,6 +2648,6 @@ void loop() {
       }
     }
   }
-  
+
   delay(10);
 }
