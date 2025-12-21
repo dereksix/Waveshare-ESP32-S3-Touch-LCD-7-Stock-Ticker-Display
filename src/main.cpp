@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.19"
+#define FIRMWARE_VERSION "1.9.21"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1395,9 +1395,9 @@ void checkGitHubOTA() {
   // Manual chunked download with progress updates
   WiFiClient *stream = dlHttp.getStreamPtr();
   size_t written = 0;
-  uint8_t buff[1024];
-  int lastPercent = 0;
-  unsigned long lastUpdate = millis();
+  uint8_t buff[4096];  // Larger buffer for faster download
+  int lastPercent = -1;
+  unsigned long lastProgressTime = millis();
   
   while (dlHttp.connected() && written < contentLength) {
     size_t available = stream->available();
@@ -1412,30 +1412,28 @@ void checkGitHubOTA() {
           break;
         }
         written += bytesWritten;
+        lastProgressTime = millis();
         
-        // Update progress bar every 1% or 500ms
+        // Update progress bar every 5%
         int percent = (written * 100) / contentLength;
-        if (percent != lastPercent || millis() - lastUpdate > 500) {
+        if (percent >= lastPercent + 5 || percent == 100) {
           lastPercent = percent;
-          lastUpdate = millis();
           
           char progressMsg[48];
           snprintf(progressMsg, sizeof(progressMsg), "Downloading... %d%%  (%d KB)", percent, written / 1024);
           updateOTAProgress(progressMsg);
           updateOTAProgressBar(percent);
           
-          // Give LVGL time to refresh
-          lvgl_port_lock(-1);
-          lv_timer_handler();
-          lvgl_port_unlock();
+          // Small delay to let LVGL background task refresh
+          delay(10);
         }
       }
     } else {
-      delay(1);  // Small delay when no data available
+      delay(10);  // Wait for more data
     }
     
-    // Timeout check - 60 seconds without progress
-    if (millis() - lastUpdate > 60000) {
+    // Timeout check - 30 seconds without progress
+    if (millis() - lastProgressTime > 30000) {
       Serial.println("Download timeout!");
       break;
     }
