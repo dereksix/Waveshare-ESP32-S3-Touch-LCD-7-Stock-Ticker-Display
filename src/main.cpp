@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.4"
+#define FIRMWARE_VERSION "1.9.5"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1149,13 +1149,13 @@ void createSettingsPopup() {
   lv_obj_center(wifiLbl);
   lv_obj_add_event_cb(wifiBtn, wifi_btn_cb, LV_EVENT_CLICKED, NULL);
   
-  // Update Firmware button
+  // Update Firmware button with version
   lv_obj_t *updateBtn = lv_btn_create(settingsPopup);
   lv_obj_set_size(updateBtn, 200, 50);
   lv_obj_align(updateBtn, LV_ALIGN_BOTTOM_MID, 0, -15);
   lv_obj_set_style_bg_color(updateBtn, lv_color_hex(0x8B5CF6), 0);
   lv_obj_t *updateLbl = lv_label_create(updateBtn);
-  lv_label_set_text(updateLbl, LV_SYMBOL_DOWNLOAD " Update FW");
+  lv_label_set_text(updateLbl, LV_SYMBOL_DOWNLOAD " Update v" FIRMWARE_VERSION);
   lv_obj_set_style_text_font(updateLbl, &lv_font_montserrat_16, 0);
   lv_obj_center(updateLbl);
   lv_obj_add_event_cb(updateBtn, [](lv_event_t *e) {
@@ -1177,13 +1177,6 @@ void createSettingsPopup() {
   lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_16, 0);
   lv_obj_center(closeLbl);
   lv_obj_add_event_cb(closeBtn, close_popup_cb, LV_EVENT_CLICKED, NULL);
-  
-  // Version label at bottom left
-  lv_obj_t *versionLbl = lv_label_create(settingsPopup);
-  lv_label_set_text(versionLbl, "v" FIRMWARE_VERSION);
-  lv_obj_set_style_text_font(versionLbl, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(versionLbl, lv_color_hex(0x666666), 0);
-  lv_obj_align(versionLbl, LV_ALIGN_BOTTOM_LEFT, 20, -25);
 }
 
 // ============ GITHUB OTA UPDATE ============
