@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.25"
+#define FIRMWARE_VERSION "1.9.26"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1408,7 +1408,7 @@ void checkGitHubOTA() {
   
   lv_obj_t *otaLabel = lv_label_create(otaOverlay);
   char startMsg[64];
-  snprintf(startMsg, sizeof(startMsg), "Updating Firmware...\n\n%d KB to download\n\nPlease wait", contentLength / 1024);
+  snprintf(startMsg, sizeof(startMsg), "Updating Firmware...\n\n%d KB\n\nPlease wait...", contentLength / 1024);
   lv_label_set_text(otaLabel, startMsg);
   lv_obj_set_style_text_font(otaLabel, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(otaLabel, lv_color_hex(0x8B5CF6), 0);
@@ -1418,58 +1418,15 @@ void checkGitHubOTA() {
   lv_refr_now(NULL);
   lvgl_port_unlock();
   
+  delay(100);  // Ensure display is updated
+  
   otaInProgress = true;
+  Serial.println("Starting OTA writeStream...");
   
-  // Download without any UI updates
-  WiFiClient *stream = dlHttp.getStreamPtr();
-  size_t written = 0;
-  uint8_t *buff = (uint8_t*)malloc(2048);
-  if (!buff) {
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaLabel, "Memory allocation failed!");
-    lv_refr_now(NULL);
-    lvgl_port_unlock();
-    delay(3000);
-    dlHttp.end();
-    ESP.restart();
-    return;
-  }
-  unsigned long lastProgressTime = millis();
-  
-  while (dlHttp.connected() && written < contentLength) {
-    size_t available = stream->available();
-    if (available) {
-      size_t toRead = min(available, (size_t)2048);
-      size_t bytesRead = stream->readBytes(buff, toRead);
-      
-      if (bytesRead > 0) {
-        size_t bytesWritten = Update.write(buff, bytesRead);
-        if (bytesWritten != bytesRead) {
-          Serial.printf("Write error: %d vs %d\n", bytesWritten, bytesRead);
-          break;
-        }
-        written += bytesWritten;
-        lastProgressTime = millis();
-        
-        // Just log progress to serial, no UI updates
-        int percent = (written * 100) / contentLength;
-        if (percent % 10 == 0) {
-          Serial.printf("OTA: %d%%\n", percent);
-        }
-      }
-    } else {
-      delay(1);
-    }
-    
-    // Timeout check - 60 seconds without progress
-    if (millis() - lastProgressTime > 60000) {
-      Serial.println("Download timeout!");
-      break;
-    }
-  }
+  // Use writeStream - simple and reliable
+  size_t written = Update.writeStream(dlHttp.getStream());
   
   dlHttp.end();
-  free(buff);
   Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
   if (written == contentLength && Update.end(true)) {
@@ -1488,6 +1445,10 @@ void checkGitHubOTA() {
     lvgl_port_unlock();
     Update.printError(Serial);
     delay(3000);
+    ESP.restart();
+  }
+  otaInProgress = false;
+};
     ESP.restart();
   }
   otaInProgress = false;
