@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.34"
+#define FIRMWARE_VERSION "1.9.36"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1459,56 +1459,11 @@ void checkGitHubOTA() {
   otaInProgress = true;
   Serial.println("Starting OTA download (LVGL suspended)...");
   
-  // Manual chunked download
+  // Use writeStream - should work now that LVGL is suspended
   WiFiClient *stream = dlHttp.getStreamPtr();
-  stream->setTimeout(30);  // 30 second timeout per read operation
+  size_t written = Update.writeStream(*stream);
   
-  const size_t buffSize = 1024;
-  uint8_t buff[1024];
-  
-  size_t written = 0;
-  int lastPct = -1;
-  
-  Serial.println("Reading firmware data...");
-  
-  while (written < contentLength) {
-    size_t remaining = contentLength - written;
-    size_t toRead = (remaining < buffSize) ? remaining : buffSize;
-    
-    // readBytes blocks until data available or timeout
-    size_t bytesRead = stream->readBytes(buff, toRead);
-    
-    if (bytesRead == 0) {
-      Serial.println("Read timeout - no more data");
-      break;
-    }
-    
-    size_t bytesWritten = Update.write(buff, bytesRead);
-    if (bytesWritten != bytesRead) {
-      Serial.printf("Write error: %d vs %d\n", bytesWritten, bytesRead);
-      break;
-    }
-    
-    written += bytesWritten;
-    
-    // Update progress every 2%
-    int pct = (written * 100) / contentLength;
-    if (pct != lastPct && (pct % 2 == 0 || pct == 100)) {
-      lastPct = pct;
-      Serial.printf("OTA: %d%% (%d/%d KB)\n", pct, written / 1024, contentLength / 1024);
-      
-      // Update UI - we can do this safely since LVGL task is suspended
-      lv_bar_set_value(progBar, pct, LV_ANIM_OFF);
-      char pctStr[16];
-      snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
-      lv_label_set_text(pctLabel, pctStr);
-      lv_refr_now(NULL);  // Manual refresh
-    }
-    
-    yield();  // Feed watchdog
-  }
-  
-  Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
+  Serial.printf("writeStream returned: %d bytes\n", written);
   
   dlHttp.end();
   
