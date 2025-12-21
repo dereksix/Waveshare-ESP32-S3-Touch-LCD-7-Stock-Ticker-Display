@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.21"
+#define FIRMWARE_VERSION "1.9.23"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1395,14 +1395,26 @@ void checkGitHubOTA() {
   // Manual chunked download with progress updates
   WiFiClient *stream = dlHttp.getStreamPtr();
   size_t written = 0;
-  uint8_t buff[4096];  // Larger buffer for faster download
+  uint8_t *buff = (uint8_t*)malloc(2048);  // Heap-allocated buffer
+  if (!buff) {
+    updateOTAProgress("Memory allocation failed");
+    delay(2000);
+    dlHttp.end();
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    return;
+  }
   int lastPercent = -1;
   unsigned long lastProgressTime = millis();
   
   while (dlHttp.connected() && written < contentLength) {
     size_t available = stream->available();
     if (available) {
-      size_t toRead = min(available, sizeof(buff));
+      size_t toRead = min(available, (size_t)2048);
       size_t bytesRead = stream->readBytes(buff, toRead);
       
       if (bytesRead > 0) {
@@ -1440,6 +1452,7 @@ void checkGitHubOTA() {
   }
   
   dlHttp.end();
+  free(buff);
   Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
   if (written == contentLength && Update.end(true)) {
