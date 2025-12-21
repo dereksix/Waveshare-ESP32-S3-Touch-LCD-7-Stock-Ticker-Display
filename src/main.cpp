@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.28"
+#define FIRMWARE_VERSION "1.9.30"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1389,7 +1389,7 @@ void checkGitHubOTA() {
     return;
   }
   
-  // Create static full-screen overlay to prevent all LVGL updates
+  // Create static full-screen overlay
   lvgl_port_lock(-1);
   if (otaProgressPopup) {
     lv_obj_del(otaProgressPopup);
@@ -1418,14 +1418,65 @@ void checkGitHubOTA() {
   lv_refr_now(NULL);
   lvgl_port_unlock();
   
-  delay(100);  // Ensure display is updated
+  delay(100);
   
   otaInProgress = true;
-  Serial.println("Starting OTA writeStream...");
+  Serial.println("Starting OTA download...");
   
-  // Use writeStream - simple and reliable
-  size_t written = Update.writeStream(dlHttp.getStream());
+  // Manual chunked download - this is what worked before
+  WiFiClient *stream = dlHttp.getStreamPtr();
+  uint8_t *buff = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_8BIT);
+  if (!buff) {
+    buff = (uint8_t*)malloc(1024);  // Fallback to smaller buffer
+  }
+  size_t buffSize = buff ? (heap_caps_get_allocated_size(buff) > 1024 ? 4096 : 1024) : 0;
   
+  if (!buff) {
+    Serial.println("Buffer allocation failed!");
+    dlHttp.end();
+    ESP.restart();
+    return;
+  }
+  
+  size_t written = 0;
+  unsigned long lastDataTime = millis();
+  
+  while (dlHttp.connected() && written < contentLength) {
+    size_t available = stream->available();
+    if (available) {
+      size_t toRead = min(available, buffSize);
+      size_t bytesRead = stream->readBytes(buff, toRead);
+      
+      if (bytesRead > 0) {
+        size_t bytesWritten = Update.write(buff, bytesRead);
+        if (bytesWritten != bytesRead) {
+          Serial.printf("Write error: %d vs %d\n", bytesWritten, bytesRead);
+          break;
+        }
+        written += bytesWritten;
+        lastDataTime = millis();
+        
+        // Log every 10%
+        int pct = (written * 100) / contentLength;
+        static int lastPct = -1;
+        if (pct / 10 != lastPct / 10) {
+          lastPct = pct;
+          Serial.printf("OTA: %d%% (%d KB)\n", pct, written / 1024);
+        }
+      }
+    }
+    
+    // Short yield
+    delay(1);
+    
+    // Timeout - 30 seconds no data
+    if (millis() - lastDataTime > 30000) {
+      Serial.println("Download timeout!");
+      break;
+    }
+  }
+  
+  free(buff);
   dlHttp.end();
   Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
