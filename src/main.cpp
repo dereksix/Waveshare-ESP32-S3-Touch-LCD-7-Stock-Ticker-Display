@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.9"
+#define FIRMWARE_VERSION "1.9.10"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1397,6 +1397,7 @@ void checkGitHubOTA() {
   size_t written = 0;
   uint8_t buff[1024];
   int lastPercent = 0;
+  unsigned long lastDisplayUpdate = 0;
   
   while (written < contentLength) {
     // Feed watchdog
@@ -1404,6 +1405,10 @@ void checkGitHubOTA() {
     
     size_t available = stream->available();
     if (available == 0) {
+      // Give LVGL time to refresh while waiting for data
+      lvgl_port_lock(-1);
+      lv_timer_handler();
+      lvgl_port_unlock();
       delay(1);
       continue;
     }
@@ -1427,6 +1432,20 @@ void checkGitHubOTA() {
         snprintf(progressMsg, sizeof(progressMsg), "Installing: %d%%", percent);
         updateOTAProgress(progressMsg);
         updateOTAProgressBar(percent);
+        
+        // Let LVGL refresh the display
+        lvgl_port_lock(-1);
+        lv_timer_handler();
+        lvgl_port_unlock();
+        delay(10);  // Small delay to let display catch up
+      }
+      
+      // Periodically let LVGL refresh even without progress change (every 100ms)
+      if (millis() - lastDisplayUpdate > 100) {
+        lastDisplayUpdate = millis();
+        lvgl_port_lock(-1);
+        lv_timer_handler();
+        lvgl_port_unlock();
       }
     }
   }
