@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.36"
+#define FIRMWARE_VERSION "1.9.38"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1459,11 +1459,53 @@ void checkGitHubOTA() {
   otaInProgress = true;
   Serial.println("Starting OTA download (LVGL suspended)...");
   
-  // Use writeStream - should work now that LVGL is suspended
+  // Manual chunked download - EXACT approach that worked before (with artifacts)
   WiFiClient *stream = dlHttp.getStreamPtr();
-  size_t written = Update.writeStream(*stream);
+  uint8_t *buff = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_8BIT);
+  if (!buff) {
+    buff = (uint8_t*)malloc(1024);
+  }
+  size_t buffSize = buff ? 2048 : 0;
+  if (!buff) {
+    Serial.println("Buffer allocation failed!");
+    dlHttp.end();
+    ESP.restart();
+    return;
+  }
   
-  Serial.printf("writeStream returned: %d bytes\n", written);
+  size_t written = 0;
+  int lastPct = -1;
+  
+  Serial.println("Reading firmware data...");
+  
+  while (dlHttp.connected() && written < contentLength) {
+    size_t available = stream->available();
+    if (available) {
+      size_t toRead = min(available, buffSize);
+      size_t bytesRead = stream->readBytes(buff, toRead);
+      if (bytesRead > 0) {
+        size_t bytesWritten = Update.write(buff, bytesRead);
+        written += bytesWritten;
+        
+        int pct = (written * 100) / contentLength;
+        if (pct / 10 != lastPct / 10) {
+          lastPct = pct;
+          Serial.printf("OTA: %d%% (%d/%d KB)\n", pct, written / 1024, contentLength / 1024);
+          
+          // Update progress bar - safe now with LVGL suspended
+          lv_bar_set_value(progBar, pct, LV_ANIM_OFF);
+          char pctStr[16];
+          snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+          lv_label_set_text(pctLabel, pctStr);
+          lv_refr_now(NULL);
+        }
+      }
+    }
+    delay(1);
+  }
+  
+  free(buff);
+  Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
   dlHttp.end();
   
