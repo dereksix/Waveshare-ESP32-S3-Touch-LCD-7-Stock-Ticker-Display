@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.5"
+#define FIRMWARE_VERSION "1.9.7"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1330,104 +1330,69 @@ void checkGitHubOTA() {
   // Download and apply firmware
   updateOTAProgress("Downloading firmware...");
   
-  // Use a fresh secure client for the download
+  // Close popup before download to free memory
+  updateOTAProgress("Starting download...");
+  delay(500);
+  lvgl_port_lock(-1);
+  lv_obj_del(otaProgressPopup);
+  otaProgressPopup = nullptr;
+  otaProgressLabel = nullptr;
+  otaProgressBar = nullptr;
+  lvgl_port_unlock();
+  
+  Serial.println("Downloading: " + firmwareUrl);
+  
+  // Use fresh client for download
   WiFiClientSecure dlClient;
   dlClient.setInsecure();
-  dlClient.setTimeout(30);  // 30 second timeout
+  dlClient.setTimeout(60);  // 60 second timeout
   
   HTTPClient dlHttp;
   dlHttp.begin(dlClient, firmwareUrl);
   dlHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   dlHttp.addHeader("User-Agent", "ESP32-Stock-Ticker");
-  dlHttp.setTimeout(30000);  // 30 second timeout
+  dlHttp.setTimeout(60000);  // 60 second timeout
   
   httpCode = dlHttp.GET();
   
   if (httpCode != 200) {
-    char errMsg[48];
-    snprintf(errMsg, sizeof(errMsg), "Download failed: HTTP %d", httpCode);
-    updateOTAProgress(errMsg);
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
+    Serial.printf("Download failed: HTTP %d\n", httpCode);
     dlHttp.end();
     return;
   }
   
   int contentLength = dlHttp.getSize();
+  Serial.printf("Firmware size: %d bytes\n", contentLength);
+  
   if (contentLength <= 0) {
-    updateOTAProgress("Invalid firmware size");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
+    Serial.println("Invalid firmware size");
     dlHttp.end();
     return;
   }
   
   if (!Update.begin(contentLength)) {
-    updateOTAProgress("Not enough space for update");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
+    Serial.println("Not enough space for update");
+    Update.printError(Serial);
     dlHttp.end();
     return;
   }
   
-  updateOTAProgress("Installing update...");
+  Serial.println("Writing firmware...");
   otaInProgress = true;
   
-  WiFiClient* stream = dlHttp.getStreamPtr();
-  uint8_t buff[512];  // Smaller buffer to reduce memory pressure
-  int totalRead = 0;
-  int lastPercent = 0;
-  
-  while (dlHttp.connected() && totalRead < contentLength) {
-    size_t available = stream->available();
-    if (available) {
-      int readBytes = stream->readBytes(buff, min((size_t)sizeof(buff), available));
-      Update.write(buff, readBytes);
-      totalRead += readBytes;
-      
-      int percent = (totalRead * 100) / contentLength;
-      if (percent != lastPercent && percent % 5 == 0) {  // Update UI less frequently
-        lastPercent = percent;
-        updateOTAProgressBar(percent);
-        char progMsg[32];
-        snprintf(progMsg, sizeof(progMsg), "Installing: %d%%", percent);
-        updateOTAProgress(progMsg);
-      }
-    }
-    delay(1);
-  }
+  // Use writeStream for more efficient memory usage
+  size_t written = Update.writeStream(*dlHttp.getStreamPtr());
+  Serial.printf("Written: %d bytes\n", written);
   
   dlHttp.end();
   
-  if (Update.end(true)) {
-    updateOTAProgress("Update successful! Rebooting...");
-    delay(1500);
+  if (written == contentLength && Update.end(true)) {
+    Serial.println("Update successful! Rebooting...");
+    delay(500);
     ESP.restart();
   } else {
-    updateOTAProgress("Update failed!");
+    Serial.println("Update failed!");
     Update.printError(Serial);
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
   }
   otaInProgress = false;
 }
