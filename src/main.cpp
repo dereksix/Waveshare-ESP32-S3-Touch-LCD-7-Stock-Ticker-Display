@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.39"
+#define FIRMWARE_VERSION "1.9.40"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -57,6 +57,100 @@ struct GitHubOtaTaskArgs {
 };
 
 bool isNewerVersion(const String& remote, const String& local);
+static void githubOtaTask(void *pv);
+
+// ===== Scheduled GitHub OTA (weekly @ ~3:00 AM local time) =====
+// Uses NTPClient's configured offset, so "3:00 AM" is local-to-that-offset.
+static const char *PREFS_NS = "stock";
+static const char *PREF_AUTO_OTA_LAST_EPOCH = "auto_ota_wk";  // uint32 epoch seconds
+
+static uint32_t lastAutoOtaSchedulerMs = 0;
+
+static void startGitHubOTASilentCheckAndUpdate() {
+  if (otaInProgress || githubOtaTaskHandle != nullptr) {
+    return;
+  }
+
+  Serial.println("[Auto OTA] Starting weekly check/update task (silent)");
+
+  githubOtaTaskStartMs = millis();
+  githubOtaLastProgressMs = githubOtaTaskStartMs;
+  otaInProgress = true;
+
+  GitHubOtaTaskArgs *args = static_cast<GitHubOtaTaskArgs *>(calloc(1, sizeof(GitHubOtaTaskArgs)));
+  if (!args) {
+    Serial.println("[Auto OTA] Out of memory; skipping");
+    otaInProgress = false;
+    return;
+  }
+  // Empty URL => githubOtaTask performs GitHub API check, then downloads if newer.
+  args->url[0] = '\0';
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    githubOtaTask,
+    "github_ota",
+    12288,
+    args,
+    2,
+    &githubOtaTaskHandle,
+    ARDUINO_RUNNING_CORE);
+
+  if (ok != pdPASS || githubOtaTaskHandle == nullptr) {
+    free(args);
+    githubOtaTaskHandle = nullptr;
+    otaInProgress = false;
+    Serial.println("[Auto OTA] Failed to start OTA task");
+    return;
+  }
+
+  // Persist last-run time so we only do this weekly.
+  // Use NTP-derived epoch (preferred). If NTP isn't ready, fall back to 0 and we'll try again later.
+  uint32_t epoch = timeClient.getEpochTime();
+  if (epoch > 0) {
+    Preferences p;
+    p.begin(PREFS_NS, false);
+    p.putUInt(PREF_AUTO_OTA_LAST_EPOCH, epoch);
+    p.end();
+  }
+}
+
+static void autoOtaSchedulerTick() {
+  // Throttle scheduler work.
+  uint32_t nowMs = millis();
+  if (lastAutoOtaSchedulerMs != 0 && (nowMs - lastAutoOtaSchedulerMs) < 30000) return;
+  lastAutoOtaSchedulerMs = nowMs;
+
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (otaInProgress || githubOtaTaskHandle != nullptr) return;
+
+  // Keep time reasonably fresh; NTPClient itself throttles based on its update interval.
+  timeClient.update();
+  const int hour = timeClient.getHours();
+  const int minute = timeClient.getMinutes();
+
+  // Only run during a small window around 3:00 AM to tolerate loop timing.
+  const bool inWindow = (hour == 3 && minute >= 0 && minute < 5);
+  if (!inWindow) return;
+
+  const uint32_t epoch = timeClient.getEpochTime();
+  if (epoch == 0) return;
+
+  uint32_t lastEpoch = 0;
+  {
+    Preferences p;
+    p.begin(PREFS_NS, true);
+    lastEpoch = p.getUInt(PREF_AUTO_OTA_LAST_EPOCH, 0);
+    p.end();
+  }
+
+  // Weekly cadence (7 days).
+  const uint32_t SECS_PER_WEEK = 7u * 24u * 60u * 60u;
+  if (lastEpoch != 0 && (epoch - lastEpoch) < SECS_PER_WEEK) {
+    return;
+  }
+
+  startGitHubOTASilentCheckAndUpdate();
+}
 
 static void githubOtaSetStatus(const char *msg) {
   if (!githubOtaStatusLabel) return;
@@ -1037,6 +1131,10 @@ void fetchPrice() {
       
       lv_label_set_text(statusLabel, timeBuf);
       lv_obj_invalidate(statusLabel);
+
+      // The left-side panel has shown occasional persistent artifacts over long runtimes.
+      // Explicitly invalidating it forces a clean redraw without a forced immediate refresh.
+      if (trendPanel) lv_obj_invalidate(trendPanel);
       lvgl_port_unlock();
     }
     
@@ -1895,7 +1993,10 @@ void setup() {
   lv_obj_align(fiftyTwoWeekBar, LV_ALIGN_TOP_MID, 0, 162);
   lv_bar_set_range(fiftyTwoWeekBar, 0, 100);
   lv_bar_set_value(fiftyTwoWeekBar, 50, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x21262D), LV_PART_MAIN);
+  // Make the unfilled portion clearly visible ("glass" effect)
+  lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x30363D), LV_PART_MAIN);
+  lv_obj_set_style_border_width(fiftyTwoWeekBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(fiftyTwoWeekBar, lv_color_hex(0x8B949E), LV_PART_MAIN);
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x00E676), LV_PART_INDICATOR);
   lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_MAIN);
   lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_INDICATOR);
@@ -2184,6 +2285,9 @@ void setup() {
 
 void loop() {
   // Don't call lv_timer_handler() - the LVGL task handles it
+
+  // Weekly scheduled OTA (checks + installs at ~3:00 AM local time)
+  autoOtaSchedulerTick();
   
   // Process pending actions with proper locking
   if (pendingOpenSettings || pendingClosePopup || pendingOpenWifi || 
@@ -2256,6 +2360,15 @@ void loop() {
       
       // Ticker change
       if (pendingTickerIndex >= 0) {
+        // Manual selection should disable rotation immediately (and persist it).
+        if (rotationEnabled) {
+          rotationEnabled = false;
+          lastRotationTime = millis();
+          prefs.begin("stock", false);
+          prefs.putBool("rotate_on", false);
+          prefs.end();
+        }
+
         currentSymbol = tickers[pendingTickerIndex];
         pendingTickerIndex = -1;
         pendingFetch = true;
@@ -2263,10 +2376,22 @@ void loop() {
         String display = currentSymbol + " $---.--";
         lv_label_set_text(priceLabel, display.c_str());
         lv_label_set_text(statusLabel, "Loading...");
+
+        // Clear any stale pixels when switching views.
+        lv_obj_invalidate(lv_scr_act());
       }
       
       // Custom symbol change
       if (pendingCustomSymbol) {
+        // Manual selection should disable rotation immediately (and persist it).
+        if (rotationEnabled) {
+          rotationEnabled = false;
+          lastRotationTime = millis();
+          prefs.begin("stock", false);
+          prefs.putBool("rotate_on", false);
+          prefs.end();
+        }
+
         currentSymbol = pendingCustomSymbolStr;
         pendingCustomSymbol = false;
         pendingCustomSymbolStr = "";
@@ -2275,6 +2400,9 @@ void loop() {
         String display = currentSymbol + " $---.--";
         lv_label_set_text(priceLabel, display.c_str());
         lv_label_set_text(statusLabel, "Loading...");
+
+        // Clear any stale pixels when switching views.
+        lv_obj_invalidate(lv_scr_act());
       }
       
       lvgl_port_unlock();;
