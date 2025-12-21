@@ -857,3 +857,17 @@ bool lvgl_port_deinit(void)
 
     return true;
 }
+
+void lvgl_port_suspend(void)
+{
+    if (lvgl_task_handle != nullptr) {
+        vTaskSuspend(lvgl_task_handle);
+    }
+}
+
+void lvgl_port_resume(void)
+{
+    if (lvgl_task_handle != nullptr) {
+        vTaskResume(lvgl_task_handle);
+    }
+}

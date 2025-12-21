@@ -169,6 +169,16 @@ bool lvgl_port_lock(int timeout_ms);
  */
 bool lvgl_port_unlock(void);
 
+/**
+ * @brief Suspend the LVGL task. Call this before long operations that conflict with LVGL rendering.
+ */
+void lvgl_port_suspend(void);
+
+/**
+ * @brief Resume the LVGL task after suspension.
+ */
+void lvgl_port_resume(void);
+
 #ifdef __cplusplus
 }
 #endif

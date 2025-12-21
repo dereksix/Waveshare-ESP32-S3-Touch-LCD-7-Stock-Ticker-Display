@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.32"
+#define FIRMWARE_VERSION "1.9.34"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1389,7 +1389,7 @@ void checkGitHubOTA() {
     return;
   }
   
-  // Create static full-screen overlay
+  // Create full-screen OTA overlay with progress bar, then suspend LVGL task
   lvgl_port_lock(-1);
   if (otaProgressPopup) {
     lv_obj_del(otaProgressPopup);
@@ -1398,6 +1398,7 @@ void checkGitHubOTA() {
     otaProgressBar = nullptr;
   }
   
+  // Full screen dark overlay
   lv_obj_t *otaOverlay = lv_obj_create(lv_scr_act());
   lv_obj_remove_style_all(otaOverlay);
   lv_obj_set_size(otaOverlay, 800, 480);
@@ -1406,24 +1407,59 @@ void checkGitHubOTA() {
   lv_obj_set_style_bg_opa(otaOverlay, LV_OPA_COVER, 0);
   lv_obj_clear_flag(otaOverlay, LV_OBJ_FLAG_SCROLLABLE);
   
-  lv_obj_t *otaLabel = lv_label_create(otaOverlay);
-  char startMsg[64];
-  snprintf(startMsg, sizeof(startMsg), "Updating Firmware...\n\n%d KB\n\nPlease wait...", contentLength / 1024);
-  lv_label_set_text(otaLabel, startMsg);
-  lv_obj_set_style_text_font(otaLabel, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(otaLabel, lv_color_hex(0x8B5CF6), 0);
-  lv_obj_set_style_text_align(otaLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(otaLabel);
+  // Title label
+  lv_obj_t *titleLabel = lv_label_create(otaOverlay);
+  lv_label_set_text(titleLabel, "Updating Firmware");
+  lv_obj_set_style_text_font(titleLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0x8B5CF6), 0);
+  lv_obj_align(titleLabel, LV_ALIGN_CENTER, 0, -80);
+  
+  // Size label
+  lv_obj_t *sizeLabel = lv_label_create(otaOverlay);
+  char sizeMsg[32];
+  snprintf(sizeMsg, sizeof(sizeMsg), "%d KB", contentLength / 1024);
+  lv_label_set_text(sizeLabel, sizeMsg);
+  lv_obj_set_style_text_font(sizeLabel, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(sizeLabel, lv_color_hex(0x8B949E), 0);
+  lv_obj_align(sizeLabel, LV_ALIGN_CENTER, 0, -40);
+  
+  // Progress bar - 400px wide
+  lv_obj_t *progBar = lv_bar_create(otaOverlay);
+  lv_obj_set_size(progBar, 400, 30);
+  lv_obj_align(progBar, LV_ALIGN_CENTER, 0, 20);
+  lv_bar_set_range(progBar, 0, 100);
+  lv_bar_set_value(progBar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(progBar, lv_color_hex(0x30363D), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(progBar, lv_color_hex(0x238636), LV_PART_INDICATOR);
+  lv_obj_set_style_radius(progBar, 5, LV_PART_MAIN);
+  lv_obj_set_style_radius(progBar, 5, LV_PART_INDICATOR);
+  
+  // Percentage label
+  lv_obj_t *pctLabel = lv_label_create(otaOverlay);
+  lv_label_set_text(pctLabel, "0%");
+  lv_obj_set_style_text_font(pctLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(pctLabel, lv_color_hex(0xC9D1D9), 0);
+  lv_obj_align(pctLabel, LV_ALIGN_CENTER, 0, 70);
+  
+  // Status label
+  lv_obj_t *statusLabel = lv_label_create(otaOverlay);
+  lv_label_set_text(statusLabel, "Downloading...");
+  lv_obj_set_style_text_font(statusLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x8B949E), 0);
+  lv_obj_align(statusLabel, LV_ALIGN_CENTER, 0, 110);
   
   lv_refr_now(NULL);
   lvgl_port_unlock();
   
+  // SUSPEND LVGL TASK - no more background rendering conflicts!
+  lvgl_port_suspend();
+  
   delay(100);
   
   otaInProgress = true;
-  Serial.println("Starting OTA download...");
+  Serial.println("Starting OTA download (LVGL suspended)...");
   
-  // Manual chunked download with direct read (not available() which can fail with SSL)
+  // Manual chunked download
   WiFiClient *stream = dlHttp.getStreamPtr();
   stream->setTimeout(30);  // 30 second timeout per read operation
   
@@ -1455,11 +1491,18 @@ void checkGitHubOTA() {
     
     written += bytesWritten;
     
-    // Log every 10%
+    // Update progress every 2%
     int pct = (written * 100) / contentLength;
-    if (pct / 10 != lastPct / 10) {
+    if (pct != lastPct && (pct % 2 == 0 || pct == 100)) {
       lastPct = pct;
       Serial.printf("OTA: %d%% (%d/%d KB)\n", pct, written / 1024, contentLength / 1024);
+      
+      // Update UI - we can do this safely since LVGL task is suspended
+      lv_bar_set_value(progBar, pct, LV_ANIM_OFF);
+      char pctStr[16];
+      snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+      lv_label_set_text(pctLabel, pctStr);
+      lv_refr_now(NULL);  // Manual refresh
     }
     
     yield();  // Feed watchdog
@@ -1468,22 +1511,21 @@ void checkGitHubOTA() {
   Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
   dlHttp.end();
-  Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
   
   if (written == contentLength && Update.end(true)) {
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaLabel, "Update Complete!\n\nRebooting...");
+    lv_bar_set_value(progBar, 100, LV_ANIM_OFF);
+    lv_label_set_text(pctLabel, "100%");
+    lv_label_set_text(statusLabel, "Update Complete! Rebooting...");
+    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x238636), 0);
     lv_refr_now(NULL);
-    lvgl_port_unlock();
     delay(1500);
     ESP.restart();
   } else {
-    char errMsg[64];
-    snprintf(errMsg, sizeof(errMsg), "Update Failed!\n\n%d/%d bytes\n\nRebooting...", written, contentLength);
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaLabel, errMsg);
+    char errMsg[48];
+    snprintf(errMsg, sizeof(errMsg), "Failed: %d/%d bytes", written, contentLength);
+    lv_label_set_text(statusLabel, errMsg);
+    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0xF85149), 0);
     lv_refr_now(NULL);
-    lvgl_port_unlock();
     Update.printError(Serial);
     delay(3000);
     ESP.restart();
