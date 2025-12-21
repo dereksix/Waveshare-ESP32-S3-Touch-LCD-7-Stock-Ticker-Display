@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.38"
+#define FIRMWARE_VERSION "1.9.40"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1475,12 +1475,16 @@ void checkGitHubOTA() {
   
   size_t written = 0;
   int lastPct = -1;
+  unsigned long lastDataTime = millis();
   
   Serial.println("Reading firmware data...");
+  Serial.printf("Stream ptr: %p, connected: %d\n", stream, dlHttp.connected());
   
   while (dlHttp.connected() && written < contentLength) {
     size_t available = stream->available();
+    
     if (available) {
+      lastDataTime = millis();  // Reset timeout
       size_t toRead = min(available, buffSize);
       size_t bytesRead = stream->readBytes(buff, toRead);
       if (bytesRead > 0) {
@@ -1499,6 +1503,19 @@ void checkGitHubOTA() {
           lv_label_set_text(pctLabel, pctStr);
           lv_refr_now(NULL);
         }
+      }
+    } else {
+      // No data available - check timeout
+      if (millis() - lastDataTime > 30000) {
+        Serial.println("Download timeout - no data for 30 seconds");
+        break;
+      }
+      // Log every 5 seconds that we're waiting
+      static unsigned long lastWaitLog = 0;
+      if (millis() - lastWaitLog > 5000) {
+        lastWaitLog = millis();
+        Serial.printf("Waiting for data... available=%d, connected=%d, written=%d\n", 
+                      available, dlHttp.connected(), written);
       }
     }
     delay(1);
