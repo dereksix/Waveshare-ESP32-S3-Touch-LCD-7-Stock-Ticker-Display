@@ -5,10 +5,12 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.40"
+#define FIRMWARE_VERSION "1.9.39"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
@@ -40,6 +42,411 @@ bool pendingGitHubOTA = false;
 lv_obj_t *otaProgressPopup = nullptr;
 lv_obj_t *otaProgressLabel = nullptr;
 lv_obj_t *otaProgressBar = nullptr;
+
+// GitHub OTA download task state (prevents UI lockups on TLS/GET)
+static TaskHandle_t githubOtaTaskHandle = nullptr;
+static uint32_t githubOtaTaskStartMs = 0;
+static volatile uint32_t githubOtaLastProgressMs = 0;
+static lv_obj_t *githubOtaOverlay = nullptr;
+static lv_obj_t *githubOtaStatusLabel = nullptr;
+static lv_obj_t *githubOtaWarnLabel = nullptr;
+static lv_obj_t *githubOtaProgressBar = nullptr;
+
+struct GitHubOtaTaskArgs {
+  char url[512];
+};
+
+bool isNewerVersion(const String& remote, const String& local);
+
+static void githubOtaSetStatus(const char *msg) {
+  if (!githubOtaStatusLabel) return;
+  if (!lvgl_port_lock(250)) return;
+  lv_label_set_text(githubOtaStatusLabel, msg);
+  lvgl_port_unlock();
+}
+
+static void githubOtaSetWarn(const char *msg) {
+  if (!githubOtaWarnLabel) return;
+  if (!lvgl_port_lock(250)) return;
+  lv_label_set_text(githubOtaWarnLabel, msg);
+  lvgl_port_unlock();
+}
+
+static void githubOtaSetProgress(int percent) {
+  if (!githubOtaProgressBar) return;
+  if (!lvgl_port_lock(250)) return;
+  lv_bar_set_value(githubOtaProgressBar, percent, LV_ANIM_OFF);
+  lvgl_port_unlock();
+}
+
+static void githubOtaOverlayDestroy() {
+  if (!lvgl_port_lock(250)) return;
+  if (githubOtaOverlay) {
+    lv_obj_del(githubOtaOverlay);
+    githubOtaOverlay = nullptr;
+  }
+  githubOtaStatusLabel = nullptr;
+  githubOtaWarnLabel = nullptr;
+  githubOtaProgressBar = nullptr;
+  lvgl_port_unlock();
+}
+
+static void githubOtaLvglSafeSuspend() {
+  // Never suspend the LVGL task while it may be holding the LVGL mutex.
+  // If we can't obtain the mutex promptly, skip suspension rather than deadlock.
+  if (!lvgl_port_lock(2000)) return;
+  lvgl_port_suspend();
+  lvgl_port_unlock();
+}
+
+static void githubOtaLvglSafeResume() {
+  lvgl_port_resume();
+}
+
+static void githubOtaUiPulse(const char *status, int progressPercent) {
+  // Briefly resume LVGL so it can render a frame, then suspend again.
+  // This keeps the progress bar visible while reducing RGB tearing/fragmentation.
+  githubOtaLvglSafeResume();
+  vTaskDelay(20 / portTICK_PERIOD_MS);
+
+  if (status) githubOtaSetStatus(status);
+  if (progressPercent >= 0) githubOtaSetProgress(progressPercent);
+
+  // Give LVGL time to refresh at least one frame.
+  vTaskDelay(150 / portTICK_PERIOD_MS);
+  githubOtaLvglSafeSuspend();
+}
+
+static void githubOtaTask(void *pv) {
+  Serial.printf("[GitHub OTA] Task entry core=%d freeHeap=%u freePsram=%u\n",
+                xPortGetCoreID(), ESP.getFreeHeap(), ESP.getFreePsram());
+
+  GitHubOtaTaskArgs *args = static_cast<GitHubOtaTaskArgs *>(pv);
+  String firmwareUrl = args ? String(args->url) : String();
+  if (args) free(args);
+
+  Serial.printf("[GitHub OTA] Task args: urlLen=%u\n", static_cast<unsigned>(firmwareUrl.length()));
+
+  githubOtaLastProgressMs = millis();
+
+  // Improve reliability of long HTTPS transfers.
+  WiFi.setSleep(false);
+
+  // If no URL was provided, perform the GitHub release check first.
+  if (firmwareUrl.length() == 0) {
+    githubOtaLastProgressMs = millis();
+
+    Serial.println("[GitHub OTA] Stage: build GitHub API URL");
+
+    const String apiUrl = String("https://api.github.com/repos/") + String(GITHUB_REPO) + "/releases/latest";
+
+    // UI breadcrumb before entering the blocking HTTPS phase.
+    Serial.println("[GitHub OTA] Stage: UI breadcrumb (resume + label update)");
+    githubOtaLvglSafeResume();
+    Serial.println("[GitHub OTA] Stage: UI breadcrumb resumed");
+    delay(20);
+    githubOtaSetStatus("API GET started (TLS/HTTP)...");
+    githubOtaSetProgress(0);
+    delay(20);
+
+    // On this board, TLS/HTTP can wedge when LVGL is running.
+    Serial.println("[GitHub OTA] Stage: LVGL suspend (safe)");
+    githubOtaLvglSafeSuspend();
+    Serial.println("[GitHub OTA] Stage: LVGL suspend done");
+    delay(50);
+
+    WiFiClientSecure apiClient;
+    apiClient.setInsecure();
+    apiClient.setTimeout(20000);
+#if defined(ARDUINO_ARCH_ESP32)
+    apiClient.setHandshakeTimeout(20);
+#endif
+
+    HTTPClient apiHttp;
+    apiHttp.setTimeout(20000);
+    apiHttp.setConnectTimeout(10000);
+    apiHttp.setReuse(false);
+
+    Serial.printf("[GitHub OTA] Stage: apiHttp.begin url=%s\n", apiUrl.c_str());
+    if (!apiHttp.begin(apiClient, apiUrl)) {
+      githubOtaLvglSafeResume();
+      delay(50);
+      githubOtaSetStatus("API begin failed");
+      githubOtaSetWarn("Closing...");
+      delay(2000);
+      githubOtaOverlayDestroy();
+      otaInProgress = false;
+      githubOtaTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+    }
+
+    apiHttp.addHeader("User-Agent", "ESP32-Stock-Ticker");
+    apiHttp.addHeader("Accept", "application/json");
+    apiHttp.addHeader("Connection", "close");
+
+    Serial.println("[GitHub OTA] Stage: apiHttp.GET begin");
+    uint32_t getStartMs = millis();
+    int apiCode = apiHttp.GET();
+    Serial.printf("[GitHub OTA] Stage: apiHttp.GET done in %lu ms\n", (unsigned long)(millis() - getStartMs));
+    Serial.printf("GitHub API GET HTTP: %d\n", apiCode);
+
+    githubOtaLvglSafeResume();
+    delay(20);
+    {
+      char apiMsg[48];
+      snprintf(apiMsg, sizeof(apiMsg), "API GET done (HTTP %d)", apiCode);
+      githubOtaSetStatus(apiMsg);
+    }
+    delay(120);
+
+    if (apiCode != 200) {
+      apiHttp.end();
+      githubOtaSetStatus("Failed to check GitHub");
+      githubOtaSetWarn("Closing...");
+      delay(2000);
+      githubOtaOverlayDestroy();
+      otaInProgress = false;
+      githubOtaTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+    }
+
+    String payload = apiHttp.getString();
+    apiHttp.end();
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      githubOtaSetStatus("Failed to parse release info");
+      githubOtaSetWarn("Closing...");
+      delay(2000);
+      githubOtaOverlayDestroy();
+      otaInProgress = false;
+      githubOtaTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+    }
+
+    String tagName = doc["tag_name"] | "";
+    if (tagName.startsWith("v") || tagName.startsWith("V")) {
+      tagName = tagName.substring(1);
+    }
+
+    char versionMsg[64];
+    snprintf(versionMsg, sizeof(versionMsg), "Current: v%s  Latest: v%s", FIRMWARE_VERSION, tagName.c_str());
+    githubOtaSetStatus(versionMsg);
+    delay(1500);
+
+    if (!isNewerVersion(tagName, FIRMWARE_VERSION)) {
+      githubOtaSetStatus("You're up to date!");
+      delay(2000);
+      githubOtaOverlayDestroy();
+      otaInProgress = false;
+      githubOtaTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+    }
+
+    // Find firmware.bin in assets
+    JsonArray assets = doc["assets"];
+    for (JsonObject asset : assets) {
+      String name = asset["name"] | "";
+      if (name == "firmware.bin") {
+        firmwareUrl = asset["url"] | "";
+        if (firmwareUrl.length() == 0) {
+          firmwareUrl = asset["browser_download_url"] | "";
+        }
+        break;
+      }
+    }
+
+    if (firmwareUrl.length() == 0) {
+      githubOtaSetStatus("No firmware.bin in release");
+      githubOtaSetWarn("Closing...");
+      delay(2000);
+      githubOtaOverlayDestroy();
+      otaInProgress = false;
+      githubOtaTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+    }
+
+    githubOtaSetStatus("Starting download...");
+    githubOtaSetProgress(0);
+    Serial.println("Firmware URL: " + firmwareUrl);
+  }
+
+  // On this board, TLS/HTTP can wedge when LVGL is running.
+  // Suspend LVGL before doing the firmware HTTPS work.
+  githubOtaLvglSafeSuspend();
+  delay(50);
+
+  WiFiClientSecure dlClient;
+  dlClient.setInsecure();
+  // Match the early 1.9.x OTA behavior: longer overall timeouts.
+  // (Arduino Stream timeout is milliseconds.)
+  dlClient.setTimeout(60000);
+#if defined(ARDUINO_ARCH_ESP32)
+  dlClient.setHandshakeTimeout(30);
+#endif
+
+  HTTPClient dlHttp;
+  dlHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  dlHttp.setTimeout(60000);
+  dlHttp.setConnectTimeout(20000);
+
+  if (!dlHttp.begin(dlClient, firmwareUrl)) {
+    lvgl_port_resume();
+    delay(50);
+    githubOtaSetStatus("HTTP begin failed");
+    githubOtaSetWarn("Rebooting...");
+    delay(2500);
+    ESP.restart();
+  }
+
+  dlHttp.addHeader("User-Agent", "ESP32-Stock-Ticker");
+  dlHttp.addHeader("Accept", "application/octet-stream");
+  dlHttp.addHeader("Connection", "close");
+
+  Serial.println("OTA download URL: " + firmwareUrl);
+  Serial.println("Starting firmware GET...");
+
+  int httpCode = dlHttp.GET();
+  Serial.printf("Firmware GET HTTP: %d\n", httpCode);
+
+  if (httpCode != 200) {
+    char errMsg[48];
+    snprintf(errMsg, sizeof(errMsg), "Download failed: HTTP %d", httpCode);
+    githubOtaLvglSafeResume();
+    delay(50);
+    githubOtaSetStatus(errMsg);
+    githubOtaSetWarn("Rebooting...");
+    delay(2500);
+    dlHttp.end();
+    ESP.restart();
+  }
+
+  // Now entering the streaming write phase; show initial UI state, then suspend.
+  githubOtaUiPulse("Downloading...", 0);
+
+  int contentLength = dlHttp.getSize();
+  Serial.printf("Firmware size (Content-Length): %d\n", contentLength);
+
+  if (contentLength > 0) {
+    if (!Update.begin(contentLength)) {
+      githubOtaLvglSafeResume();
+      delay(50);
+      githubOtaSetStatus("Not enough space!");
+      Update.printError(Serial);
+      githubOtaSetWarn("Rebooting...");
+      delay(2500);
+      dlHttp.end();
+      ESP.restart();
+    }
+  } else {
+    // GitHub/CDN can respond with chunked transfer (no Content-Length).
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      githubOtaLvglSafeResume();
+      delay(50);
+      githubOtaSetStatus("Not enough space!");
+      Update.printError(Serial);
+      githubOtaSetWarn("Rebooting...");
+      delay(2500);
+      dlHttp.end();
+      ESP.restart();
+    }
+  }
+
+  WiFiClient *stream = dlHttp.getStreamPtr();
+  uint8_t buff[1024];
+  size_t written = 0;
+  int lastPct = -1;
+  uint32_t lastUiPulseMs = 0;
+  uint32_t lastDataTime = millis();
+  const uint32_t DATA_TIMEOUT_MS = 30000;
+
+  // v1.9.4/v1.9.12-style loop: available()+readBytes(), with timeout and connection checks.
+  // Keep LVGL suspended most of the time, but pulse it briefly for progress updates.
+  while (dlHttp.connected() && (contentLength <= 0 || written < static_cast<size_t>(contentLength))) {
+    taskYIELD();
+
+    size_t available = stream->available();
+    if (!stream->connected() && available == 0) {
+      Serial.println("Connection lost during OTA");
+      break;
+    }
+
+    if (available == 0) {
+      if (millis() - lastDataTime > DATA_TIMEOUT_MS) {
+        Serial.println("OTA download timeout - no data received");
+        break;
+      }
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    lastDataTime = millis();
+    githubOtaLastProgressMs = lastDataTime;
+
+    size_t toRead = (available < sizeof(buff)) ? available : sizeof(buff);
+    size_t bytesRead = stream->readBytes(buff, toRead);
+    if (bytesRead == 0) {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    size_t bytesWritten = Update.write(buff, bytesRead);
+    if (bytesWritten != bytesRead) {
+      Serial.println("Write error during OTA");
+      break;
+    }
+
+    written += bytesWritten;
+
+    if (contentLength > 0) {
+      int pct = static_cast<int>((written * 100ULL) / static_cast<uint64_t>(contentLength));
+      if (pct > 100) pct = 100;
+
+      // Update UI at 10% increments, throttled to avoid display fragmentation.
+      // (Also ensures the UI isn't pulsed too frequently if data arrives fast.)
+      if (pct != lastPct && (pct % 10 == 0)) {
+        uint32_t now = millis();
+        if (lastUiPulseMs == 0 || (now - lastUiPulseMs) >= 700) {
+          lastPct = pct;
+          lastUiPulseMs = now;
+
+          char msg[32];
+          snprintf(msg, sizeof(msg), "Installing: %d%%", pct);
+          githubOtaUiPulse(msg, pct);
+        }
+      }
+    }
+  }
+
+  dlHttp.end();
+
+  Serial.printf("OTA wrote %u bytes\n", static_cast<unsigned>(written));
+
+  bool ok = false;
+  if (contentLength > 0) {
+    ok = (written == static_cast<size_t>(contentLength)) && Update.end(true);
+  } else {
+    ok = Update.end(true);
+  }
+
+  // Now we can resume LVGL and show final status.
+  githubOtaLvglSafeResume();
+  delay(50);
+
+  if (ok) {
+    githubOtaSetStatus("Update Complete!");
+    githubOtaSetWarn("Rebooting...");
+    delay(1500);
+    ESP.restart();
+  } else {
+    githubOtaSetStatus("Update failed");
+    Update.printError(Serial);
+    githubOtaSetWarn("Rebooting...");
+    delay(2500);
+    ESP.restart();
+  }
+}
 
 // UI elements
 lv_obj_t *priceLabel = nullptr;
@@ -1160,6 +1567,7 @@ void createSettingsPopup() {
   lv_obj_center(updateLbl);
   lv_obj_add_event_cb(updateBtn, [](lv_event_t *e) {
     // Trigger GitHub OTA check (runs in loop() to avoid blocking LVGL)
+    Serial.println("[UI] Firmware update button pressed");
     pendingGitHubOTA = true;
     // Close settings popup
     if (settingsPopup) {
@@ -1193,358 +1601,128 @@ bool isNewerVersion(const String& remote, const String& local) {
 
 void updateOTAProgress(const char* msg) {
   if (otaProgressLabel) {
-    lvgl_port_lock(-1);
-    lv_label_set_text(otaProgressLabel, msg);
-    lvgl_port_unlock();
+    if (lvgl_port_lock(250)) {
+      lv_label_set_text(otaProgressLabel, msg);
+      lvgl_port_unlock();
+    }
   }
   Serial.println(msg);
 }
 
 void updateOTAProgressBar(int percent) {
   if (otaProgressBar) {
-    lvgl_port_lock(-1);
-    lv_bar_set_value(otaProgressBar, percent, LV_ANIM_OFF);
-    lvgl_port_unlock();
+    if (lvgl_port_lock(250)) {
+      lv_bar_set_value(otaProgressBar, percent, LV_ANIM_OFF);
+      lvgl_port_unlock();
+    }
   }
 }
 
 void checkGitHubOTA() {
-  // Create progress popup
-  lvgl_port_lock(-1);
-  otaProgressPopup = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(otaProgressPopup, 550, 200);
-  lv_obj_center(otaProgressPopup);
-  lv_obj_set_style_bg_color(otaProgressPopup, lv_color_hex(0x1A1A1A), 0);
-  lv_obj_set_style_border_color(otaProgressPopup, lv_color_hex(0x8B5CF6), 0);
-  lv_obj_set_style_border_width(otaProgressPopup, 2, 0);
-  lv_obj_set_style_radius(otaProgressPopup, 15, 0);
-  lv_obj_clear_flag(otaProgressPopup, LV_OBJ_FLAG_SCROLLABLE);
-  
-  lv_obj_t *title = lv_label_create(otaProgressPopup);
-  lv_label_set_text(title, "Checking for Updates...");
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(title, lv_color_hex(0x8B5CF6), 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
-  
-  otaProgressLabel = lv_label_create(otaProgressPopup);
-  lv_label_set_text(otaProgressLabel, "Connecting to GitHub...");
-  lv_obj_set_style_text_font(otaProgressLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(otaProgressLabel, lv_color_hex(0xC9D1D9), 0);
-  lv_obj_align(otaProgressLabel, LV_ALIGN_CENTER, 0, 0);
-  
-  otaProgressBar = lv_bar_create(otaProgressPopup);
-  lv_obj_set_size(otaProgressBar, 400, 20);
-  lv_obj_align(otaProgressBar, LV_ALIGN_BOTTOM_MID, 0, -20);
-  lv_bar_set_value(otaProgressBar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(otaProgressBar, lv_color_hex(0x30363D), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(otaProgressBar, lv_color_hex(0x8B5CF6), LV_PART_INDICATOR);
-  lvgl_port_unlock();
-  
-  // Check GitHub releases API
-  WiFiClientSecure client;
-  client.setInsecure();  // Skip certificate verification for simplicity
-  
-  HTTPClient http;
-  String url = "https://api.github.com/repos/" GITHUB_REPO "/releases/latest";
-  http.begin(client, url);
-  http.addHeader("User-Agent", "ESP32-Stock-Ticker");
-  
-  int httpCode = http.GET();
-  if (httpCode != 200) {
-    updateOTAProgress("Failed to check GitHub releases");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    http.end();
+  if (otaInProgress || githubOtaTaskHandle != nullptr) {
+    Serial.printf("[GitHub OTA] Ignored; in progress (otaInProgress=%d task=%p)\n",
+                  otaInProgress ? 1 : 0, (void *)githubOtaTaskHandle);
     return;
   }
-  
-  String payload = http.getString();
-  http.end();
-  
-  // Parse JSON
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    updateOTAProgress("Failed to parse release info");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    return;
-  }
-  
-  String tagName = doc["tag_name"] | "";
-  // Remove 'v' prefix if present
-  if (tagName.startsWith("v") || tagName.startsWith("V")) {
-    tagName = tagName.substring(1);
-  }
-  
-  char versionMsg[64];
-  snprintf(versionMsg, sizeof(versionMsg), "Current: v%s  Latest: v%s", FIRMWARE_VERSION, tagName.c_str());
-  updateOTAProgress(versionMsg);
-  delay(1500);
-  
-  if (!isNewerVersion(tagName, FIRMWARE_VERSION)) {
-    updateOTAProgress("You're up to date!");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    return;
-  }
-  
-  // Find firmware.bin in assets
-  String firmwareUrl = "";
-  JsonArray assets = doc["assets"];
-  for (JsonObject asset : assets) {
-    String name = asset["name"] | "";
-    if (name == "firmware.bin") {
-      firmwareUrl = asset["browser_download_url"] | "";
-      break;
+
+  Serial.println("[GitHub OTA] Starting update flow");
+
+  // Single UI: full-screen overlay for both "checking" and "downloading".
+  if (lvgl_port_lock(250)) {
+    if (githubOtaOverlay) {
+      lv_obj_del(githubOtaOverlay);
+      githubOtaOverlay = nullptr;
     }
-  }
-  
-  if (firmwareUrl.length() == 0) {
-    updateOTAProgress("No firmware.bin in release");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
+    if (otaProgressPopup) {
+      lv_obj_del(otaProgressPopup);
+      otaProgressPopup = nullptr;
+      otaProgressLabel = nullptr;
+      otaProgressBar = nullptr;
+    }
+
+    githubOtaOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(githubOtaOverlay);
+    lv_obj_set_size(githubOtaOverlay, 800, 480);
+    lv_obj_set_pos(githubOtaOverlay, 0, 0);
+    lv_obj_set_style_bg_color(githubOtaOverlay, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_bg_opa(githubOtaOverlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(githubOtaOverlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *titleLabel = lv_label_create(githubOtaOverlay);
+    lv_label_set_text(titleLabel, "Firmware Update");
+    lv_obj_set_style_text_font(titleLabel, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(titleLabel, lv_color_hex(0x8B5CF6), 0);
+    lv_obj_align(titleLabel, LV_ALIGN_CENTER, 0, -80);
+
+    lv_obj_t *dlStatusLabel = lv_label_create(githubOtaOverlay);
+    lv_label_set_text(dlStatusLabel, "Checking GitHub...");
+    lv_obj_set_style_text_font(dlStatusLabel, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(dlStatusLabel, lv_color_hex(0xC9D1D9), 0);
+    lv_obj_align(dlStatusLabel, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *progBar = lv_bar_create(githubOtaOverlay);
+    lv_obj_set_size(progBar, 400, 25);
+    lv_obj_align(progBar, LV_ALIGN_CENTER, 0, 30);
+    lv_bar_set_range(progBar, 0, 100);
+    lv_bar_set_value(progBar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(progBar, lv_color_hex(0x30363D), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(progBar, lv_color_hex(0x238636), LV_PART_INDICATOR);
+
+    lv_obj_t *warnLabel = lv_label_create(githubOtaOverlay);
+    lv_label_set_text(warnLabel, "Please wait, do not power off");
+    lv_obj_set_style_text_font(warnLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(warnLabel, lv_color_hex(0x8B949E), 0);
+    lv_obj_align(warnLabel, LV_ALIGN_CENTER, 0, 80);
+
+    githubOtaStatusLabel = dlStatusLabel;
+    githubOtaWarnLabel = warnLabel;
+    githubOtaProgressBar = progBar;
     lvgl_port_unlock();
-    return;
   }
   
-  // Download and apply firmware
-  updateOTAProgress("Downloading firmware...");
-  Serial.println("Downloading: " + firmwareUrl);
-  
-  // Use fresh client for download
-  WiFiClientSecure dlClient;
-  dlClient.setInsecure();
-  dlClient.setTimeout(60);  // 60 second timeout
-  
-  HTTPClient dlHttp;
-  dlHttp.begin(dlClient, firmwareUrl);
-  dlHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  dlHttp.addHeader("User-Agent", "ESP32-Stock-Ticker");
-  dlHttp.setTimeout(60000);  // 60 second timeout
-  
-  httpCode = dlHttp.GET();
-  
-  if (httpCode != 200) {
-    char errMsg[64];
-    snprintf(errMsg, sizeof(errMsg), "Download failed: HTTP %d", httpCode);
-    updateOTAProgress(errMsg);
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    dlHttp.end();
-    return;
-  }
-  
-  int contentLength = dlHttp.getSize();
-  Serial.printf("Firmware size: %d bytes\n", contentLength);
-  
-  if (contentLength <= 0) {
-    updateOTAProgress("Invalid firmware size");
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    dlHttp.end();
-    return;
-  }
-  
-  if (!Update.begin(contentLength)) {
-    updateOTAProgress("Not enough space for update");
-    Update.printError(Serial);
-    delay(2000);
-    lvgl_port_lock(-1);
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-    lvgl_port_unlock();
-    dlHttp.end();
-    return;
-  }
-  
-  // Create full-screen OTA overlay with progress bar, then suspend LVGL task
-  lvgl_port_lock(-1);
-  if (otaProgressPopup) {
-    lv_obj_del(otaProgressPopup);
-    otaProgressPopup = nullptr;
-    otaProgressLabel = nullptr;
-    otaProgressBar = nullptr;
-  }
-  
-  // Full screen dark overlay
-  lv_obj_t *otaOverlay = lv_obj_create(lv_scr_act());
-  lv_obj_remove_style_all(otaOverlay);
-  lv_obj_set_size(otaOverlay, 800, 480);
-  lv_obj_set_pos(otaOverlay, 0, 0);
-  lv_obj_set_style_bg_color(otaOverlay, lv_color_hex(0x0D1117), 0);
-  lv_obj_set_style_bg_opa(otaOverlay, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(otaOverlay, LV_OBJ_FLAG_SCROLLABLE);
-  
-  // Title label
-  lv_obj_t *titleLabel = lv_label_create(otaOverlay);
-  lv_label_set_text(titleLabel, "Updating Firmware");
-  lv_obj_set_style_text_font(titleLabel, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0x8B5CF6), 0);
-  lv_obj_align(titleLabel, LV_ALIGN_CENTER, 0, -80);
-  
-  // Size label
-  lv_obj_t *sizeLabel = lv_label_create(otaOverlay);
-  char sizeMsg[32];
-  snprintf(sizeMsg, sizeof(sizeMsg), "%d KB", contentLength / 1024);
-  lv_label_set_text(sizeLabel, sizeMsg);
-  lv_obj_set_style_text_font(sizeLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(sizeLabel, lv_color_hex(0x8B949E), 0);
-  lv_obj_align(sizeLabel, LV_ALIGN_CENTER, 0, -40);
-  
-  // Progress bar - 400px wide
-  lv_obj_t *progBar = lv_bar_create(otaOverlay);
-  lv_obj_set_size(progBar, 400, 30);
-  lv_obj_align(progBar, LV_ALIGN_CENTER, 0, 20);
-  lv_bar_set_range(progBar, 0, 100);
-  lv_bar_set_value(progBar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(progBar, lv_color_hex(0x30363D), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(progBar, lv_color_hex(0x238636), LV_PART_INDICATOR);
-  lv_obj_set_style_radius(progBar, 5, LV_PART_MAIN);
-  lv_obj_set_style_radius(progBar, 5, LV_PART_INDICATOR);
-  
-  // Percentage label
-  lv_obj_t *pctLabel = lv_label_create(otaOverlay);
-  lv_label_set_text(pctLabel, "0%");
-  lv_obj_set_style_text_font(pctLabel, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(pctLabel, lv_color_hex(0xC9D1D9), 0);
-  lv_obj_align(pctLabel, LV_ALIGN_CENTER, 0, 70);
-  
-  // Status label
-  lv_obj_t *statusLabel = lv_label_create(otaOverlay);
-  lv_label_set_text(statusLabel, "Downloading...");
-  lv_obj_set_style_text_font(statusLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x8B949E), 0);
-  lv_obj_align(statusLabel, LV_ALIGN_CENTER, 0, 110);
-  
-  lv_refr_now(NULL);
-  lvgl_port_unlock();
-  
-  // SUSPEND LVGL TASK - no more background rendering conflicts!
-  lvgl_port_suspend();
-  
-  delay(100);
-  
+  // Kick off the blocking HTTPS API check + download in its own task.
+  githubOtaTaskStartMs = millis();
+  githubOtaLastProgressMs = githubOtaTaskStartMs;
   otaInProgress = true;
-  Serial.println("Starting OTA download (LVGL suspended)...");
-  
-  // Manual chunked download - EXACT approach that worked before (with artifacts)
-  WiFiClient *stream = dlHttp.getStreamPtr();
-  uint8_t *buff = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_8BIT);
-  if (!buff) {
-    buff = (uint8_t*)malloc(1024);
-  }
-  size_t buffSize = buff ? 2048 : 0;
-  if (!buff) {
-    Serial.println("Buffer allocation failed!");
-    dlHttp.end();
+
+  GitHubOtaTaskArgs *args = static_cast<GitHubOtaTaskArgs *>(calloc(1, sizeof(GitHubOtaTaskArgs)));
+  if (!args) {
+    githubOtaSetStatus("Out of memory");
+    githubOtaSetWarn("Rebooting...");
+    delay(2500);
     ESP.restart();
     return;
   }
-  
-  size_t written = 0;
-  int lastPct = -1;
-  unsigned long lastDataTime = millis();
-  
-  Serial.println("Reading firmware data...");
-  Serial.printf("Stream ptr: %p, connected: %d\n", stream, dlHttp.connected());
-  
-  while (dlHttp.connected() && written < contentLength) {
-    size_t available = stream->available();
-    
-    if (available) {
-      lastDataTime = millis();  // Reset timeout
-      size_t toRead = min(available, buffSize);
-      size_t bytesRead = stream->readBytes(buff, toRead);
-      if (bytesRead > 0) {
-        size_t bytesWritten = Update.write(buff, bytesRead);
-        written += bytesWritten;
-        
-        int pct = (written * 100) / contentLength;
-        if (pct / 10 != lastPct / 10) {
-          lastPct = pct;
-          Serial.printf("OTA: %d%% (%d/%d KB)\n", pct, written / 1024, contentLength / 1024);
-          
-          // Update progress bar - safe now with LVGL suspended
-          lv_bar_set_value(progBar, pct, LV_ANIM_OFF);
-          char pctStr[16];
-          snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
-          lv_label_set_text(pctLabel, pctStr);
-          lv_refr_now(NULL);
-        }
-      }
-    } else {
-      // No data available - check timeout
-      if (millis() - lastDataTime > 30000) {
-        Serial.println("Download timeout - no data for 30 seconds");
-        break;
-      }
-      // Log every 5 seconds that we're waiting
-      static unsigned long lastWaitLog = 0;
-      if (millis() - lastWaitLog > 5000) {
-        lastWaitLog = millis();
-        Serial.printf("Waiting for data... available=%d, connected=%d, written=%d\n", 
-                      available, dlHttp.connected(), written);
-      }
-    }
-    delay(1);
-  }
-  
-  free(buff);
-  Serial.printf("Download complete: %d/%d bytes\n", written, contentLength);
-  
-  dlHttp.end();
-  
-  if (written == contentLength && Update.end(true)) {
-    lv_bar_set_value(progBar, 100, LV_ANIM_OFF);
-    lv_label_set_text(pctLabel, "100%");
-    lv_label_set_text(statusLabel, "Update Complete! Rebooting...");
-    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x238636), 0);
-    lv_refr_now(NULL);
-    delay(1500);
+  args->url[0] = '\0';
+
+  Serial.printf("[GitHub OTA] Creating task... freeHeap=%u freePsram=%u\n",
+                ESP.getFreeHeap(), ESP.getFreePsram());
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    githubOtaTask,
+    "github_ota",
+    12288,
+    args,
+    2,
+    &githubOtaTaskHandle,
+    ARDUINO_RUNNING_CORE);
+
+  Serial.printf("[GitHub OTA] xTaskCreatePinnedToCore => %ld handle=%p\n",
+                static_cast<long>(ok), (void *)githubOtaTaskHandle);
+
+  if (ok != pdPASS || githubOtaTaskHandle == nullptr) {
+    free(args);
+    githubOtaSetStatus("Failed to start OTA task");
+    githubOtaSetWarn("Rebooting...");
+    delay(2500);
     ESP.restart();
-  } else {
-    char errMsg[48];
-    snprintf(errMsg, sizeof(errMsg), "Failed: %d/%d bytes", written, contentLength);
-    lv_label_set_text(statusLabel, errMsg);
-    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0xF85149), 0);
-    lv_refr_now(NULL);
-    Update.printError(Serial);
-    delay(3000);
-    ESP.restart();
+    return;
   }
-  otaInProgress = false;
+
+  Serial.printf("[GitHub OTA] Task started: %p\n", (void *)githubOtaTaskHandle);
+
+  // Return to loop() so the UI/WiFi stack keep breathing.
+  return;
 }
 
 // ============ OTA UPDATE WEB SERVER ============
@@ -2113,6 +2291,24 @@ void loop() {
   if (pendingGitHubOTA) {
     pendingGitHubOTA = false;
     checkGitHubOTA();
+  }
+
+  // Supervise GitHub OTA task: if TLS/GET stalls forever, kill & reboot.
+  if (otaInProgress && githubOtaTaskHandle != nullptr) {
+    uint32_t now = millis();
+    uint32_t last = githubOtaLastProgressMs;
+
+    // If we have no progress for 25s (and at least 25s since start), it’s wedged.
+    if ((now - githubOtaTaskStartMs) > 25000 && (now - last) > 25000) {
+      Serial.println("OTA appears stuck; aborting and rebooting");
+      githubOtaSetStatus("Connection stalled");
+      githubOtaSetWarn("Rebooting...");
+
+      vTaskDelete(githubOtaTaskHandle);
+      githubOtaTaskHandle = nullptr;
+      delay(2000);
+      ESP.restart();
+    }
   }
   
   // Check async WiFi scan
