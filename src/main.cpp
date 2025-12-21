@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.41"
+#define FIRMWARE_VERSION "1.9.42"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1994,10 +1994,18 @@ void setup() {
   lv_bar_set_range(fiftyTwoWeekBar, 0, 100);
   lv_bar_set_value(fiftyTwoWeekBar, 50, LV_ANIM_OFF);
   // Make the unfilled portion clearly visible ("glass" effect)
+  // - LV_PART_MAIN is the "empty" portion of the glass
+  // - LV_PART_INDICATOR is the "filled" portion
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x30363D), LV_PART_MAIN);
-  lv_obj_set_style_border_width(fiftyTwoWeekBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(fiftyTwoWeekBar, LV_OPA_70, LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(fiftyTwoWeekBar, lv_color_hex(0x21262D), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(fiftyTwoWeekBar, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(fiftyTwoWeekBar, 2, LV_PART_MAIN);
   lv_obj_set_style_border_color(fiftyTwoWeekBar, lv_color_hex(0x8B949E), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(fiftyTwoWeekBar, 2, LV_PART_MAIN);
+
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x00E676), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(fiftyTwoWeekBar, LV_OPA_COVER, LV_PART_INDICATOR);
   lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_MAIN);
   lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_INDICATOR);
   
@@ -2128,7 +2136,7 @@ void setup() {
   // Clock display - upper left, subtle
   clockLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(clockLabel, "--:-- --");
-  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(clockLabel, lv_color_hex(0x8B949E), 0);
   lv_obj_align(clockLabel, LV_ALIGN_TOP_LEFT, 15, 12);
   
