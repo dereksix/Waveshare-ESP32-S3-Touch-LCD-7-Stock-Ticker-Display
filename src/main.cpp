@@ -5,16 +5,23 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
+#define FIRMWARE_VERSION "1.9.0"
+#define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
+
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ESPmDNS.h>
 #include "config.h"
 
 using namespace esp_panel::board;
@@ -22,6 +29,17 @@ using namespace esp_panel::board;
 Preferences prefs;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000);
+
+// OTA Web Server
+WebServer otaServer(80);
+bool otaInProgress = false;
+String otaStatus = "";
+
+// GitHub OTA state
+bool pendingGitHubOTA = false;
+lv_obj_t *otaProgressPopup = nullptr;
+lv_obj_t *otaProgressLabel = nullptr;
+lv_obj_t *otaProgressBar = nullptr;
 
 // UI elements
 lv_obj_t *priceLabel = nullptr;
@@ -183,8 +201,8 @@ bool pendingWifiConnect = false;
 bool pendingShowKeyboard = false;
 int pendingNetworkIndex = -1;
 
-// API Key - loaded from config.h
-const char* twelvedataKey = TWELVEDATA_API_KEY;
+// API Key - stored in Preferences, falls back to config.h
+String apiKey = "";  // Loaded from Preferences on startup
 
 // Tickers
 const char* tickers[] = {"MSFT", "AAPL", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "SPY", "QQQ"};
@@ -279,7 +297,7 @@ bool prefetchStockData(const String& symbol) {
   }
   
   HTTPClient http;
-  String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + twelvedataKey;
+  String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + apiKey;
   
   http.begin(url);
   http.setTimeout(5000);
@@ -379,14 +397,15 @@ void applyPrefetchedData() {
   snprintf(fiftyTwoLowBuf, sizeof(fiftyTwoLowBuf), "%.2f", prefetchedStock.fiftyTwoLow);
   snprintf(fiftyTwoHighBuf, sizeof(fiftyTwoHighBuf), "%.2f", prefetchedStock.fiftyTwoHigh);
   
-  // Update symbol with company name
-  char symbolWithName[80];
+  // Update company name and symbol separately
   if (prefetchedStock.companyName.length() > 0) {
-    snprintf(symbolWithName, sizeof(symbolWithName), "%s - $%s", prefetchedStock.companyName.c_str(), currentSymbol.c_str());
+    lv_label_set_text(companyNameLabel, prefetchedStock.companyName.c_str());
   } else {
-    snprintf(symbolWithName, sizeof(symbolWithName), "$%s", currentSymbol.c_str());
+    lv_label_set_text(companyNameLabel, "");
   }
-  lv_label_set_text(symbolLabel, symbolWithName);
+  char symbolBuf[16];
+  snprintf(symbolBuf, sizeof(symbolBuf), "$%s", currentSymbol.c_str());
+  lv_label_set_text(symbolLabel, symbolBuf);
   
   lv_label_set_text(priceLabel, priceBuf);
   lv_label_set_text(changeLabel, pctBuf);
@@ -461,7 +480,7 @@ void fetchPrice() {
   }
   
   HTTPClient http;
-  String url = "https://api.twelvedata.com/quote?symbol=" + currentSymbol + "&apikey=" + twelvedataKey;
+  String url = "https://api.twelvedata.com/quote?symbol=" + currentSymbol + "&apikey=" + apiKey;
   
   http.begin(url);
   http.setTimeout(5000);
@@ -555,14 +574,15 @@ void fetchPrice() {
     snprintf(fiftyTwoHighBuf, sizeof(fiftyTwoHighBuf), "%.2f", fiftyTwoHigh);
     
     if (lvgl_port_lock(100)) {
-      // Update ticker with company name (Company Name - TICKER format)
-      char symbolWithName[80];
+      // Update company name and ticker separately
       if (companyName.length() > 0) {
-        snprintf(symbolWithName, sizeof(symbolWithName), "%s - $%s", companyName.c_str(), currentSymbol.c_str());
+        lv_label_set_text(companyNameLabel, companyName.c_str());
       } else {
-        snprintf(symbolWithName, sizeof(symbolWithName), "$%s", currentSymbol.c_str());
+        lv_label_set_text(companyNameLabel, "");
       }
-      lv_label_set_text(symbolLabel, symbolWithName);
+      char symbolBuf[16];
+      snprintf(symbolBuf, sizeof(symbolBuf), "$%s", currentSymbol.c_str());
+      lv_label_set_text(symbolLabel, symbolBuf);
       
       lv_label_set_text(priceLabel, priceBuf);
       lv_label_set_text(changeLabel, pctBuf);
@@ -1120,17 +1140,36 @@ void createSettingsPopup() {
   lv_obj_add_flag(customSymbolKeyboard, LV_OBJ_FLAG_HIDDEN);
   
   lv_obj_t *wifiBtn = lv_btn_create(settingsPopup);
-  lv_obj_set_size(wifiBtn, 180, 50);
+  lv_obj_set_size(wifiBtn, 160, 50);
   lv_obj_align(wifiBtn, LV_ALIGN_BOTTOM_LEFT, 20, -15);
   lv_obj_set_style_bg_color(wifiBtn, lv_color_hex(0x0066CC), 0);
   lv_obj_t *wifiLbl = lv_label_create(wifiBtn);
-  lv_label_set_text(wifiLbl, LV_SYMBOL_WIFI " WiFi Setup");
+  lv_label_set_text(wifiLbl, LV_SYMBOL_WIFI " WiFi");
   lv_obj_set_style_text_font(wifiLbl, &lv_font_montserrat_16, 0);
   lv_obj_center(wifiLbl);
   lv_obj_add_event_cb(wifiBtn, wifi_btn_cb, LV_EVENT_CLICKED, NULL);
   
+  // Update Firmware button
+  lv_obj_t *updateBtn = lv_btn_create(settingsPopup);
+  lv_obj_set_size(updateBtn, 200, 50);
+  lv_obj_align(updateBtn, LV_ALIGN_BOTTOM_MID, 0, -15);
+  lv_obj_set_style_bg_color(updateBtn, lv_color_hex(0x8B5CF6), 0);
+  lv_obj_t *updateLbl = lv_label_create(updateBtn);
+  lv_label_set_text(updateLbl, LV_SYMBOL_DOWNLOAD " Update FW");
+  lv_obj_set_style_text_font(updateLbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(updateLbl);
+  lv_obj_add_event_cb(updateBtn, [](lv_event_t *e) {
+    // Trigger GitHub OTA check (runs in loop() to avoid blocking LVGL)
+    pendingGitHubOTA = true;
+    // Close settings popup
+    if (settingsPopup) {
+      lv_obj_del(settingsPopup);
+      settingsPopup = nullptr;
+    }
+  }, LV_EVENT_CLICKED, NULL);
+  
   lv_obj_t *closeBtn = lv_btn_create(settingsPopup);
-  lv_obj_set_size(closeBtn, 120, 50);
+  lv_obj_set_size(closeBtn, 100, 50);
   lv_obj_align(closeBtn, LV_ALIGN_BOTTOM_RIGHT, -20, -15);
   lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x666666), 0);
   lv_obj_t *closeLbl = lv_label_create(closeBtn);
@@ -1138,6 +1177,307 @@ void createSettingsPopup() {
   lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_16, 0);
   lv_obj_center(closeLbl);
   lv_obj_add_event_cb(closeBtn, close_popup_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============ GITHUB OTA UPDATE ============
+// Compare version strings like "1.8.0" > "1.7.0"
+bool isNewerVersion(const String& remote, const String& local) {
+  int rMajor = 0, rMinor = 0, rPatch = 0;
+  int lMajor = 0, lMinor = 0, lPatch = 0;
+  sscanf(remote.c_str(), "%d.%d.%d", &rMajor, &rMinor, &rPatch);
+  sscanf(local.c_str(), "%d.%d.%d", &lMajor, &lMinor, &lPatch);
+  if (rMajor != lMajor) return rMajor > lMajor;
+  if (rMinor != lMinor) return rMinor > lMinor;
+  return rPatch > lPatch;
+}
+
+void updateOTAProgress(const char* msg) {
+  if (otaProgressLabel) {
+    lvgl_port_lock(-1);
+    lv_label_set_text(otaProgressLabel, msg);
+    lvgl_port_unlock();
+  }
+  Serial.println(msg);
+}
+
+void updateOTAProgressBar(int percent) {
+  if (otaProgressBar) {
+    lvgl_port_lock(-1);
+    lv_bar_set_value(otaProgressBar, percent, LV_ANIM_OFF);
+    lvgl_port_unlock();
+  }
+}
+
+void checkGitHubOTA() {
+  // Create progress popup
+  lvgl_port_lock(-1);
+  otaProgressPopup = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(otaProgressPopup, 550, 200);
+  lv_obj_center(otaProgressPopup);
+  lv_obj_set_style_bg_color(otaProgressPopup, lv_color_hex(0x1A1A1A), 0);
+  lv_obj_set_style_border_color(otaProgressPopup, lv_color_hex(0x8B5CF6), 0);
+  lv_obj_set_style_border_width(otaProgressPopup, 2, 0);
+  lv_obj_set_style_radius(otaProgressPopup, 15, 0);
+  lv_obj_clear_flag(otaProgressPopup, LV_OBJ_FLAG_SCROLLABLE);
+  
+  lv_obj_t *title = lv_label_create(otaProgressPopup);
+  lv_label_set_text(title, "Checking for Updates...");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(0x8B5CF6), 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+  
+  otaProgressLabel = lv_label_create(otaProgressPopup);
+  lv_label_set_text(otaProgressLabel, "Connecting to GitHub...");
+  lv_obj_set_style_text_font(otaProgressLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(otaProgressLabel, lv_color_hex(0xC9D1D9), 0);
+  lv_obj_align(otaProgressLabel, LV_ALIGN_CENTER, 0, 0);
+  
+  otaProgressBar = lv_bar_create(otaProgressPopup);
+  lv_obj_set_size(otaProgressBar, 400, 20);
+  lv_obj_align(otaProgressBar, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_bar_set_value(otaProgressBar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(otaProgressBar, lv_color_hex(0x30363D), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(otaProgressBar, lv_color_hex(0x8B5CF6), LV_PART_INDICATOR);
+  lvgl_port_unlock();
+  
+  // Check GitHub releases API
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip certificate verification for simplicity
+  
+  HTTPClient http;
+  String url = "https://api.github.com/repos/" GITHUB_REPO "/releases/latest";
+  http.begin(client, url);
+  http.addHeader("User-Agent", "ESP32-Stock-Ticker");
+  
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    updateOTAProgress("Failed to check GitHub releases");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    http.end();
+    return;
+  }
+  
+  String payload = http.getString();
+  http.end();
+  
+  // Parse JSON
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    updateOTAProgress("Failed to parse release info");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    return;
+  }
+  
+  String tagName = doc["tag_name"] | "";
+  // Remove 'v' prefix if present
+  if (tagName.startsWith("v") || tagName.startsWith("V")) {
+    tagName = tagName.substring(1);
+  }
+  
+  char versionMsg[64];
+  snprintf(versionMsg, sizeof(versionMsg), "Current: v%s  Latest: v%s", FIRMWARE_VERSION, tagName.c_str());
+  updateOTAProgress(versionMsg);
+  delay(1500);
+  
+  if (!isNewerVersion(tagName, FIRMWARE_VERSION)) {
+    updateOTAProgress("You're up to date!");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    return;
+  }
+  
+  // Find firmware.bin in assets
+  String firmwareUrl = "";
+  JsonArray assets = doc["assets"];
+  for (JsonObject asset : assets) {
+    String name = asset["name"] | "";
+    if (name == "firmware.bin") {
+      firmwareUrl = asset["browser_download_url"] | "";
+      break;
+    }
+  }
+  
+  if (firmwareUrl.length() == 0) {
+    updateOTAProgress("No firmware.bin in release");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    return;
+  }
+  
+  // Download and apply firmware
+  updateOTAProgress("Downloading firmware...");
+  
+  http.begin(client, firmwareUrl);
+  http.addHeader("User-Agent", "ESP32-Stock-Ticker");
+  httpCode = http.GET();
+  
+  if (httpCode != 200) {
+    char errMsg[48];
+    snprintf(errMsg, sizeof(errMsg), "Download failed: HTTP %d", httpCode);
+    updateOTAProgress(errMsg);
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    http.end();
+    return;
+  }
+  
+  int contentLength = http.getSize();
+  if (contentLength <= 0) {
+    updateOTAProgress("Invalid firmware size");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    http.end();
+    return;
+  }
+  
+  if (!Update.begin(contentLength)) {
+    updateOTAProgress("Not enough space for update");
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+    http.end();
+    return;
+  }
+  
+  updateOTAProgress("Installing update...");
+  otaInProgress = true;
+  
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buff[1024];
+  int totalRead = 0;
+  int lastPercent = 0;
+  
+  while (http.connected() && totalRead < contentLength) {
+    size_t available = stream->available();
+    if (available) {
+      int readBytes = stream->readBytes(buff, min((size_t)sizeof(buff), available));
+      Update.write(buff, readBytes);
+      totalRead += readBytes;
+      
+      int percent = (totalRead * 100) / contentLength;
+      if (percent != lastPercent) {
+        lastPercent = percent;
+        updateOTAProgressBar(percent);
+        char progMsg[32];
+        snprintf(progMsg, sizeof(progMsg), "Installing: %d%%", percent);
+        updateOTAProgress(progMsg);
+      }
+    }
+    delay(1);
+  }
+  
+  http.end();
+  
+  if (Update.end(true)) {
+    updateOTAProgress("Update successful! Rebooting...");
+    delay(1500);
+    ESP.restart();
+  } else {
+    updateOTAProgress("Update failed!");
+    Update.printError(Serial);
+    delay(2000);
+    lvgl_port_lock(-1);
+    lv_obj_del(otaProgressPopup);
+    otaProgressPopup = nullptr;
+    otaProgressLabel = nullptr;
+    otaProgressBar = nullptr;
+    lvgl_port_unlock();
+  }
+  otaInProgress = false;
+}
+
+// ============ OTA UPDATE WEB SERVER ============
+const char* otaPage = R"rawliteral(
+<!DOCTYPE html><html><head><title>Stock Ticker</title>
+<style>body{font-family:Arial;background:#0D1117;color:#C9D1D9;text-align:center;padding:50px}
+h1{color:#58A6FF}input{margin:10px}input[type=submit]{background:#238636;color:#fff;padding:15px 30px;border:none;border-radius:6px;cursor:pointer}</style></head>
+<body><h1>Stock Ticker OTA</h1><p>v)rawliteral" FIRMWARE_VERSION R"rawliteral(</p>
+<form method='POST' action='/update' enctype='multipart/form-data'>
+<input type='file' name='update' accept='.bin' required><br>
+<input type='submit' value='Upload Firmware'></form></body></html>
+)rawliteral";
+
+void handleOTAUpload() {
+  HTTPUpload& upload = otaServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("OTA Start: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("OTA Done: %u bytes\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
+void setupOTA() {
+  Serial.println("Setting up OTA server...");
+  
+  if (!MDNS.begin("stockticker")) {
+    Serial.println("mDNS failed");
+  }
+  
+  otaServer.on("/", HTTP_GET, []() {
+    otaServer.send(200, "text/html", otaPage);
+  });
+  
+  otaServer.on("/update", HTTP_POST, []() {
+    bool success = !Update.hasError();
+    otaServer.send(200, "text/html", success ? 
+      "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>Success! Rebooting...</h1></body></html>" :
+      "<html><body style='background:#0D1117;color:#FF5252;text-align:center;padding:50px'><h1>Failed!</h1></body></html>");
+    if (success) {
+      delay(1000);
+      ESP.restart();
+    }
+  }, handleOTAUpload);
+  
+  otaServer.begin();
+  Serial.println("OTA ready at http://stockticker.local");
 }
 
 void setup() {
@@ -1225,26 +1565,33 @@ void setup() {
   lv_obj_align(fiftyTwoWeekLowLabel, LV_ALIGN_TOP_MID, 0, 290);
   
   // ===== Main content area (shifted right, centered vertically) =====
-  // Ticker symbol with company name - big font like price
+  // Company name - row 1 (truncate with ... if too long)
+  companyNameLabel = lv_label_create(lv_scr_act());
+  lv_label_set_text(companyNameLabel, "Loading...");
+  lv_obj_set_style_text_font(companyNameLabel, &lv_font_montserrat_30, 0);
+  lv_obj_set_style_text_color(companyNameLabel, lv_color_hex(0x8B949E), 0);
+  lv_obj_set_width(companyNameLabel, 540);
+  lv_label_set_long_mode(companyNameLabel, LV_LABEL_LONG_DOT);
+  lv_obj_align(companyNameLabel, LV_ALIGN_TOP_MID, 70, 10);
+  
+  // Ticker symbol - row 2
   symbolLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(symbolLabel, currentSymbol.c_str());
-  lv_obj_set_style_text_font(symbolLabel, &lv_font_montserrat_36, 0);
+  lv_obj_set_style_text_font(symbolLabel, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(symbolLabel, lv_color_hex(0x58A6FF), 0);
-  lv_obj_set_width(symbolLabel, 540);
-  lv_label_set_long_mode(symbolLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_obj_align(symbolLabel, LV_ALIGN_TOP_MID, 70, 10);
+  lv_obj_align(symbolLabel, LV_ALIGN_TOP_MID, 70, 45);
   
-  // Main price (pushed down for ~0.75" gap from company name)
+  // Main price - row 3
   priceLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(priceLabel, "$---.--");
   lv_obj_set_style_text_font(priceLabel, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(priceLabel, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(priceLabel, LV_ALIGN_TOP_MID, 70, 85);
+  lv_obj_align(priceLabel, LV_ALIGN_TOP_MID, 70, 100);
   
   // Container for change values side by side
   lv_obj_t *changeContainer = lv_obj_create(lv_scr_act());
   lv_obj_set_size(changeContainer, 450, 55);
-  lv_obj_align(changeContainer, LV_ALIGN_TOP_MID, 70, 145);
+  lv_obj_align(changeContainer, LV_ALIGN_TOP_MID, 70, 160);
   lv_obj_set_style_bg_opa(changeContainer, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(changeContainer, 0, 0);
   lv_obj_clear_flag(changeContainer, LV_OBJ_FLAG_SCROLLABLE);
@@ -1267,7 +1614,7 @@ void setup() {
   // ===== Decorative horizontal line =====
   lv_obj_t *hLine = lv_obj_create(lv_scr_act());
   lv_obj_set_size(hLine, 500, 2);
-  lv_obj_align(hLine, LV_ALIGN_TOP_MID, 70, 210);
+  lv_obj_align(hLine, LV_ALIGN_TOP_MID, 70, 225);
   lv_obj_set_style_bg_color(hLine, lv_color_hex(0x30363D), 0);
   lv_obj_set_style_radius(hLine, 1, 0);
   lv_obj_set_style_border_width(hLine, 0, 0);
@@ -1275,7 +1622,7 @@ void setup() {
   // ===== Day Range Bar =====
   lv_obj_t *rangeContainer = lv_obj_create(lv_scr_act());
   lv_obj_set_size(rangeContainer, 500, 45);
-  lv_obj_align(rangeContainer, LV_ALIGN_TOP_MID, 70, 220);
+  lv_obj_align(rangeContainer, LV_ALIGN_TOP_MID, 70, 235);
   lv_obj_set_style_bg_opa(rangeContainer, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(rangeContainer, 0, 0);
   lv_obj_clear_flag(rangeContainer, LV_OBJ_FLAG_SCROLLABLE);
@@ -1317,21 +1664,21 @@ void setup() {
   lv_label_set_text(ohlLabel, "O: --   H: --   L: --");
   lv_obj_set_style_text_font(ohlLabel, &lv_font_montserrat_26, 0);
   lv_obj_set_style_text_color(ohlLabel, lv_color_hex(0x8B949E), 0);
-  lv_obj_align(ohlLabel, LV_ALIGN_TOP_MID, 70, 280);
+  lv_obj_align(ohlLabel, LV_ALIGN_TOP_MID, 70, 295);
   
   // ===== Volume =====
   volumeLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(volumeLabel, "Vol: --");
   lv_obj_set_style_text_font(volumeLabel, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(volumeLabel, lv_color_hex(0x8B949E), 0);
-  lv_obj_align(volumeLabel, LV_ALIGN_TOP_MID, 70, 310);
+  lv_obj_align(volumeLabel, LV_ALIGN_TOP_MID, 70, 330);
   
   // ===== Market Status (now in main area under volume) =====
   marketStatusLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(marketStatusLabel, "Market Closed");
   lv_obj_set_style_text_font(marketStatusLabel, &lv_font_montserrat_26, 0);
   lv_obj_set_style_text_color(marketStatusLabel, lv_color_hex(0xFF9800), 0);
-  lv_obj_align(marketStatusLabel, LV_ALIGN_TOP_MID, 70, 340);
+  lv_obj_align(marketStatusLabel, LV_ALIGN_TOP_MID, 70, 360);
   
   // Clock display - upper left, subtle
   clockLabel = lv_label_create(lv_scr_act());
@@ -1408,7 +1755,14 @@ void setup() {
   prefs.begin("stock", true);
   currentSymbol = prefs.getString("symbol", "MSFT");
   lastPrice = prefs.getString("price", "N/A");
+  // Load API key - fall back to compiled key if not saved
+  apiKey = prefs.getString("apikey", "");
+  if (apiKey.length() == 0) {
+    apiKey = TWELVEDATA_API_KEY;  // Fall back to compiled config
+  }
   prefs.end();
+  
+  Serial.printf("API Key loaded: %s***\n", apiKey.substring(0, 4).c_str());
   
   if (lvgl_port_lock(100)) {
     lv_label_set_text(symbolLabel, currentSymbol.c_str());
@@ -1439,6 +1793,9 @@ void setup() {
     
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("WiFi connected!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+      
       if (lvgl_port_lock(100)) {
         lv_label_set_text(statusLabel, "Connected");
         lvgl_port_unlock();
@@ -1461,6 +1818,10 @@ void setup() {
       }
       
       fetchPrice();
+      
+      // Start OTA web server
+      delay(500);
+      setupOTA();
     } else {
       if (lvgl_port_lock(100)) {
         lv_label_set_text(statusLabel, "WiFi Failed - tap Settings");
@@ -1582,6 +1943,12 @@ void loop() {
     fetchPrice();
   }
   
+  // Handle GitHub OTA check outside of LVGL lock
+  if (pendingGitHubOTA) {
+    pendingGitHubOTA = false;
+    checkGitHubOTA();
+  }
+  
   // Check async WiFi scan
   if (wifiScanInProgress) {
     int result = WiFi.scanComplete();
@@ -1636,6 +2003,7 @@ void loop() {
         if (lvgl_port_lock(100)) {
           // Fade out
           lv_obj_set_style_opa(priceLabel, LV_OPA_0, 0);
+          lv_obj_set_style_opa(companyNameLabel, LV_OPA_0, 0);
           lv_obj_set_style_opa(symbolLabel, LV_OPA_0, 0);
           lv_obj_set_style_opa(changeLabel, LV_OPA_0, 0);
           lv_obj_set_style_opa(dollarChangeLabel, LV_OPA_0, 0);
@@ -1652,6 +2020,7 @@ void loop() {
           
           // Fade back in
           lv_obj_set_style_opa(priceLabel, LV_OPA_COVER, 0);
+          lv_obj_set_style_opa(companyNameLabel, LV_OPA_COVER, 0);
           lv_obj_set_style_opa(symbolLabel, LV_OPA_COVER, 0);
           lv_obj_set_style_opa(changeLabel, LV_OPA_COVER, 0);
           lv_obj_set_style_opa(dollarChangeLabel, LV_OPA_COVER, 0);
@@ -1697,6 +2066,9 @@ void loop() {
       }
     }
   }
+  
+  // Handle OTA web server requests
+  otaServer.handleClient();
   
   // Update clock display every second
   static uint32_t lastClockUpdate = 0;
