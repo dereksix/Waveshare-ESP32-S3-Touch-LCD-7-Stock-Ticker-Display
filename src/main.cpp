@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.26"
+#define FIRMWARE_VERSION "1.9.27"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1445,10 +1445,6 @@ void checkGitHubOTA() {
     lvgl_port_unlock();
     Update.printError(Serial);
     delay(3000);
-    ESP.restart();
-  }
-  otaInProgress = false;
-};
     ESP.restart();
   }
   otaInProgress = false;
