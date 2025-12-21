@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.51"
+#define FIRMWARE_VERSION "1.9.52"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1701,6 +1701,19 @@ void createSettingsPopup() {
       settingsPopup = nullptr;
     }
   }, LV_EVENT_CLICKED, NULL);
+
+  // Web management URL (shows the device IP for manual web updates / API key changes)
+  lv_obj_t *webUrlLbl = lv_label_create(settingsPopup);
+  lv_obj_set_style_text_font(webUrlLbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(webUrlLbl, lv_color_hex(0xCCCCCC), 0);
+  String webUrlText;
+  if (WiFi.status() == WL_CONNECTED) {
+    webUrlText = "Web: http://" + WiFi.localIP().toString() + "/";
+  } else {
+    webUrlText = "Web: (WiFi not connected)";
+  }
+  lv_label_set_text(webUrlLbl, webUrlText.c_str());
+  lv_obj_align(webUrlLbl, LV_ALIGN_BOTTOM_MID, 0, -70);
   
   lv_obj_t *closeBtn = lv_btn_create(settingsPopup);
   lv_obj_set_size(closeBtn, 100, 50);
