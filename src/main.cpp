@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.43"
+#define FIRMWARE_VERSION "1.9.44"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -2138,7 +2138,7 @@ void setup() {
   // Clock display - upper left, subtle
   clockLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(clockLabel, "--:-- --");
-  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_26, 0);
   lv_obj_set_style_text_color(clockLabel, lv_color_hex(0x8B949E), 0);
   lv_obj_align(clockLabel, LV_ALIGN_TOP_LEFT, 15, 12);
   
