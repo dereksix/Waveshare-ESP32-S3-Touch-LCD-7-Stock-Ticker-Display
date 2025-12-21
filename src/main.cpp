@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.11"
+#define FIRMWARE_VERSION "1.9.12"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1398,20 +1398,38 @@ void checkGitHubOTA() {
   uint8_t buff[1024];
   int lastPercent = 0;
   unsigned long lastDisplayUpdate = 0;
+  unsigned long lastDataTime = millis();
+  const unsigned long DATA_TIMEOUT = 30000;  // 30 second timeout for no data
   
   while (written < contentLength) {
     // Feed watchdog
     yield();
     
+    // Check if connection is still alive
+    if (!stream->connected() && stream->available() == 0) {
+      Serial.println("Connection lost during OTA");
+      updateOTAProgress("Connection lost!");
+      break;
+    }
+    
     size_t available = stream->available();
     if (available == 0) {
+      // Check for timeout
+      if (millis() - lastDataTime > DATA_TIMEOUT) {
+        Serial.println("OTA download timeout - no data received");
+        updateOTAProgress("Download timeout!");
+        break;
+      }
       // Give LVGL time to refresh while waiting for data
       lvgl_port_lock(-1);
       lv_timer_handler();
       lvgl_port_unlock();
-      delay(1);
+      delay(10);
       continue;
     }
+    
+    // Reset timeout since we have data
+    lastDataTime = millis();
     
     size_t toRead = min(available, sizeof(buff));
     size_t bytesRead = stream->readBytes(buff, toRead);
@@ -1420,6 +1438,7 @@ void checkGitHubOTA() {
       size_t bytesWritten = Update.write(buff, bytesRead);
       if (bytesWritten != bytesRead) {
         Serial.println("Write error during OTA");
+        updateOTAProgress("Write error!");
         break;
       }
       written += bytesWritten;
@@ -1432,15 +1451,10 @@ void checkGitHubOTA() {
         snprintf(progressMsg, sizeof(progressMsg), "Installing: %d%%", percent);
         updateOTAProgress(progressMsg);
         updateOTAProgressBar(percent);
-        
-        // Let LVGL refresh the display
-        lvgl_port_lock(-1);
-        lv_timer_handler();
-        lvgl_port_unlock();
-        delay(10);  // Small delay to let display catch up
+        Serial.printf("OTA Progress: %d%% (%d/%d bytes)\n", percent, written, contentLength);
       }
       
-      // Periodically let LVGL refresh even without progress change (every 100ms)
+      // Periodically let LVGL refresh (every 100ms)
       if (millis() - lastDisplayUpdate > 100) {
         lastDisplayUpdate = millis();
         lvgl_port_lock(-1);
