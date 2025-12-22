@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.53"
+#define FIRMWARE_VERSION "1.9.54"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -1982,10 +1982,9 @@ void setup() {
 #if ESP_PANEL_DRIVERS_BUS_ENABLE_RGB && defined(CONFIG_IDF_TARGET_ESP32S3)
       auto *lcd_bus = lcd_pre->getBus();
       if (lcd_bus && lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
-        // Increase bounce buffer depth to reduce rare long-run RGB artifacts.
-        // The argument is a size in pixels or bytes depending on the underlying driver;
-        // using a larger multiple has proven more robust on 800x480 RGB565 panels.
-        static_cast<esp_panel::drivers::BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd_pre->getFrameWidth() * 40);
+        // Use bounce buffer to reduce rare long-run RGB artifacts.
+        // Keep the multiplier conservative to avoid flicker.
+        static_cast<esp_panel::drivers::BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd_pre->getFrameWidth() * 10);
       }
 #endif
     }
