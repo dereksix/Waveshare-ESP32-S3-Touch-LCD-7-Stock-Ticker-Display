@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.55"
+#define FIRMWARE_VERSION "1.9.57"
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -566,6 +566,11 @@ lv_obj_t *fiftyTwoWeekBar = nullptr;
 lv_obj_t *fiftyTwoWeekLowLabel = nullptr;
 lv_obj_t *fiftyTwoWeekHighLabel = nullptr;
 
+// 1-Month range UI elements
+lv_obj_t *oneMonthBar = nullptr;
+lv_obj_t *oneMonthLowLabel = nullptr;
+lv_obj_t *oneMonthHighLabel = nullptr;
+
 // State flags
 String currentSymbol = "MSFT";
 String lastPrice = "N/A";
@@ -617,7 +622,8 @@ struct CachedStockData {
   String volumeStr;
   String companyName;
   float low, high, fiftyTwoLow, fiftyTwoHigh;
-  int dayRangePos, fiftyTwoPos;
+  float oneMonthLow, oneMonthHigh;  // 1-month range
+  int dayRangePos, fiftyTwoPos, oneMonthPos;
   bool marketOpen;
   uint32_t fetchTime;  // millis() when data was fetched
 } cachedData = {false};
@@ -703,10 +709,23 @@ struct PrefetchedData {
   float volume;
   float fiftyTwoLow;
   float fiftyTwoHigh;
+  float oneMonthLow;   // 1-month range
+  float oneMonthHigh;
   String companyName;
   bool marketOpen;
 };
 PrefetchedData prefetchedStock = {false};
+
+// 1-Month data cache (per symbol, fetched once daily)
+struct OneMonthCache {
+  String symbol;
+  float low;
+  float high;
+  int fetchDay;  // Day of month when fetched
+  bool valid;
+};
+OneMonthCache oneMonthCache[20];
+int oneMonthCacheCount = 0;
 
 // WiFi setup state
 lv_obj_t *wifiPopup = nullptr;
@@ -753,6 +772,9 @@ void parseRotationList() {
   }
   rotationIndex = 0;
 }
+
+// Forward declaration
+bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
 
 // Prefetch stock data for a symbol (for smooth rotation)
 // Uses cached data when market is closed to save API calls
@@ -819,6 +841,10 @@ bool prefetchStockData(const String& symbol) {
         prefetchedStock.openPrice = ohlStr.substring(oIdx + 3, hIdx).toFloat();
       }
       
+      // Restore 1-month data from cache
+      prefetchedStock.oneMonthLow = cached->oneMonthLow;
+      prefetchedStock.oneMonthHigh = cached->oneMonthHigh;
+      
       prefetchedStock.valid = true;
       return true;
     }
@@ -870,11 +896,113 @@ bool prefetchStockData(const String& symbol) {
     
     prefetchedStock.valid = true;
     http.end();
+    
+    // Fetch 1-month range (cached daily, won't make API call if already fetched today)
+    prefetchedStock.oneMonthLow = 0.0;
+    prefetchedStock.oneMonthHigh = 0.0;
+    fetchOneMonthRange(symbol, prefetchedStock.oneMonthLow, prefetchedStock.oneMonthHigh);
+    
     return true;
   }
   
   http.end();
   prefetchedStock.valid = false;
+  return false;
+}
+
+// Find cached 1-month data for a symbol
+OneMonthCache* findOneMonthCache(const String& symbol) {
+  for (int i = 0; i < oneMonthCacheCount; i++) {
+    if (oneMonthCache[i].valid && oneMonthCache[i].symbol == symbol) {
+      return &oneMonthCache[i];
+    }
+  }
+  return nullptr;
+}
+
+// Add or update 1-month data in cache
+void cacheOneMonthData(const String& symbol, float low, float high, int day) {
+  // Check if symbol already exists
+  for (int i = 0; i < oneMonthCacheCount; i++) {
+    if (oneMonthCache[i].symbol == symbol) {
+      oneMonthCache[i].low = low;
+      oneMonthCache[i].high = high;
+      oneMonthCache[i].fetchDay = day;
+      oneMonthCache[i].valid = true;
+      return;
+    }
+  }
+  // Add new entry if space available
+  if (oneMonthCacheCount < 20) {
+    oneMonthCache[oneMonthCacheCount].symbol = symbol;
+    oneMonthCache[oneMonthCacheCount].low = low;
+    oneMonthCache[oneMonthCacheCount].high = high;
+    oneMonthCache[oneMonthCacheCount].fetchDay = day;
+    oneMonthCache[oneMonthCacheCount].valid = true;
+    oneMonthCacheCount++;
+  }
+}
+
+// Fetch 1-month high/low from time_series API (once per day per symbol)
+bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  // Get current day of month
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  struct tm* timeInfo = gmtime((time_t*)&epochTime);
+  int currentDay = timeInfo->tm_mday;
+  
+  // Check if we already have cached data for today
+  OneMonthCache* cached = findOneMonthCache(symbol);
+  if (cached != nullptr && cached->fetchDay == currentDay) {
+    outLow = cached->low;
+    outHigh = cached->high;
+    Serial.printf("1M range cached for %s: %.2f - %.2f\n", symbol.c_str(), outLow, outHigh);
+    return true;
+  }
+  
+  // Need to fetch - get 22 trading days of daily data
+  HTTPClient http;
+  String url = "https://api.twelvedata.com/time_series?symbol=" + symbol + 
+               "&interval=1day&outputsize=22&apikey=" + apiKey;
+  
+  Serial.printf("Fetching 1M range for %s...\n", symbol.c_str());
+  http.begin(url);
+  http.setTimeout(8000);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    
+    if (!err && doc["values"].is<JsonArray>()) {
+      JsonArray values = doc["values"].as<JsonArray>();
+      float monthLow = 999999.0;
+      float monthHigh = 0.0;
+      
+      for (JsonObject bar : values) {
+        float h = 0.0, l = 0.0;
+        if (bar["high"].is<const char*>()) h = atof(bar["high"].as<const char*>());
+        if (bar["low"].is<const char*>()) l = atof(bar["low"].as<const char*>());
+        if (h > monthHigh) monthHigh = h;
+        if (l < monthLow && l > 0) monthLow = l;
+      }
+      
+      if (monthHigh > 0 && monthLow < 999999.0) {
+        outLow = monthLow;
+        outHigh = monthHigh;
+        cacheOneMonthData(symbol, monthLow, monthHigh, currentDay);
+        Serial.printf("1M range fetched for %s: %.2f - %.2f\n", symbol.c_str(), outLow, outHigh);
+        http.end();
+        return true;
+      }
+    }
+  }
+  
+  http.end();
+  Serial.printf("Failed to fetch 1M range for %s (code %d)\n", symbol.c_str(), code);
   return false;
 }
 
@@ -927,6 +1055,18 @@ void applyPrefetchedData() {
   snprintf(fiftyTwoLowBuf, sizeof(fiftyTwoLowBuf), "%.2f", prefetchedStock.fiftyTwoLow);
   snprintf(fiftyTwoHighBuf, sizeof(fiftyTwoHighBuf), "%.2f", prefetchedStock.fiftyTwoHigh);
   
+  // 1-Month range calculation
+  int oneMonthPos = 50;
+  if (prefetchedStock.oneMonthHigh > prefetchedStock.oneMonthLow) {
+    oneMonthPos = (int)(((closePrice - prefetchedStock.oneMonthLow) / (prefetchedStock.oneMonthHigh - prefetchedStock.oneMonthLow)) * 100);
+    if (oneMonthPos < 0) oneMonthPos = 0;
+    if (oneMonthPos > 100) oneMonthPos = 100;
+  }
+  
+  char oneMonthLowBuf[12], oneMonthHighBuf[12];
+  snprintf(oneMonthLowBuf, sizeof(oneMonthLowBuf), "%.2f", prefetchedStock.oneMonthLow);
+  snprintf(oneMonthHighBuf, sizeof(oneMonthHighBuf), "%.2f", prefetchedStock.oneMonthHigh);
+  
   // Update company name and symbol separately
   if (prefetchedStock.companyName.length() > 0) {
     lv_label_set_text(companyNameLabel, prefetchedStock.companyName.c_str());
@@ -956,6 +1096,14 @@ void applyPrefetchedData() {
   lv_label_set_text(fiftyTwoWeekHighLabel, fiftyTwoHighBuf);
   lv_bar_set_value(fiftyTwoWeekBar, fiftyTwoPos, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, changeColor, LV_PART_INDICATOR);
+  
+  // Update 1-month range bar and labels
+  if (oneMonthBar != nullptr) {
+    lv_label_set_text(oneMonthLowLabel, oneMonthLowBuf);
+    lv_label_set_text(oneMonthHighLabel, oneMonthHighBuf);
+    lv_bar_set_value(oneMonthBar, oneMonthPos, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(oneMonthBar, lv_color_hex(0x58A6FF), LV_PART_INDICATOR);  // Blue for 1M
+  }
   
   lv_label_set_text(marketStatusLabel, prefetchedStock.marketOpen ? "Market Open" : "Market Closed");
   lv_obj_set_style_text_color(marketStatusLabel, 
@@ -990,8 +1138,11 @@ void applyPrefetchedData() {
   newCache.high = prefetchedStock.highPrice;
   newCache.fiftyTwoLow = prefetchedStock.fiftyTwoLow;
   newCache.fiftyTwoHigh = prefetchedStock.fiftyTwoHigh;
+  newCache.oneMonthLow = prefetchedStock.oneMonthLow;
+  newCache.oneMonthHigh = prefetchedStock.oneMonthHigh;
   newCache.dayRangePos = rangePos;
   newCache.fiftyTwoPos = fiftyTwoPos;
+  newCache.oneMonthPos = oneMonthPos;
   newCache.marketOpen = prefetchedStock.marketOpen;
   newCache.fetchTime = millis();
   cacheSymbolData(newCache);
@@ -2006,8 +2157,8 @@ void setup() {
   
   // ===== Left Side Trend Panel =====
   trendPanel = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(trendPanel, 145, 340);
-  lv_obj_align(trendPanel, LV_ALIGN_LEFT_MID, 10, 0);
+  lv_obj_set_size(trendPanel, 155, 340);  // Slightly wider for two bars
+  lv_obj_align(trendPanel, LV_ALIGN_LEFT_MID, 5, 0);
   lv_obj_set_style_bg_color(trendPanel, lv_color_hex(0x161B22), 0);
   lv_obj_set_style_border_color(trendPanel, lv_color_hex(0x00E676), 0);
   lv_obj_set_style_border_width(trendPanel, 2, 0);
@@ -2037,27 +2188,38 @@ void setup() {
   
   // "52 Week Range" title
   lv_obj_t *fiftyTwoTitle = lv_label_create(trendPanel);
-  lv_label_set_text(fiftyTwoTitle, "52 Week");
-  lv_obj_set_style_text_font(fiftyTwoTitle, &lv_font_montserrat_14, 0);
+  lv_label_set_text(fiftyTwoTitle, "52W");
+  lv_obj_set_style_text_font(fiftyTwoTitle, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(fiftyTwoTitle, lv_color_hex(0x8B949E), 0);
-  lv_obj_align(fiftyTwoTitle, LV_ALIGN_TOP_MID, 0, 115);
+  lv_obj_align(fiftyTwoTitle, LV_ALIGN_TOP_LEFT, 25, 115);
   
-  // 52-week high label (on top)
+  // "1 Month" title
+  lv_obj_t *oneMonthTitle = lv_label_create(trendPanel);
+  lv_label_set_text(oneMonthTitle, "1M");
+  lv_obj_set_style_text_font(oneMonthTitle, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(oneMonthTitle, lv_color_hex(0x8B949E), 0);
+  lv_obj_align(oneMonthTitle, LV_ALIGN_TOP_RIGHT, -35, 115);
+  
+  // 52-week high label (on top, left side)
   fiftyTwoWeekHighLabel = lv_label_create(trendPanel);
   lv_label_set_text(fiftyTwoWeekHighLabel, "0.00");
   lv_obj_set_style_text_font(fiftyTwoWeekHighLabel, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(fiftyTwoWeekHighLabel, lv_color_hex(0x00E676), 0);
-  lv_obj_align(fiftyTwoWeekHighLabel, LV_ALIGN_TOP_MID, 0, 140);
+  lv_obj_align(fiftyTwoWeekHighLabel, LV_ALIGN_TOP_LEFT, 12, 132);
   
-  // 52-week range bar (vertical)
+  // 1-month high label (on top, right side)
+  oneMonthHighLabel = lv_label_create(trendPanel);
+  lv_label_set_text(oneMonthHighLabel, "0.00");
+  lv_obj_set_style_text_font(oneMonthHighLabel, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(oneMonthHighLabel, lv_color_hex(0x00E676), 0);
+  lv_obj_align(oneMonthHighLabel, LV_ALIGN_TOP_RIGHT, -12, 132);
+  
+  // 52-week range bar (vertical, left side)
   fiftyTwoWeekBar = lv_bar_create(trendPanel);
-  lv_obj_set_size(fiftyTwoWeekBar, 24, 120);
-  lv_obj_align(fiftyTwoWeekBar, LV_ALIGN_TOP_MID, 0, 162);
+  lv_obj_set_size(fiftyTwoWeekBar, 20, 110);
+  lv_obj_align(fiftyTwoWeekBar, LV_ALIGN_TOP_LEFT, 20, 150);
   lv_bar_set_range(fiftyTwoWeekBar, 0, 100);
   lv_bar_set_value(fiftyTwoWeekBar, 50, LV_ANIM_OFF);
-  // Make the unfilled portion clearly visible ("glass" effect)
-  // - LV_PART_MAIN is the "empty" portion of the glass
-  // - LV_PART_INDICATOR is the "filled" portion
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x30363D), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(fiftyTwoWeekBar, LV_OPA_70, LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(fiftyTwoWeekBar, lv_color_hex(0x21262D), LV_PART_MAIN);
@@ -2065,18 +2227,42 @@ void setup() {
   lv_obj_set_style_border_width(fiftyTwoWeekBar, 2, LV_PART_MAIN);
   lv_obj_set_style_border_color(fiftyTwoWeekBar, lv_color_hex(0x8B949E), LV_PART_MAIN);
   lv_obj_set_style_pad_all(fiftyTwoWeekBar, 2, LV_PART_MAIN);
-
   lv_obj_set_style_bg_color(fiftyTwoWeekBar, lv_color_hex(0x00E676), LV_PART_INDICATOR);
   lv_obj_set_style_bg_opa(fiftyTwoWeekBar, LV_OPA_COVER, LV_PART_INDICATOR);
-  lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_MAIN);
-  lv_obj_set_style_radius(fiftyTwoWeekBar, 12, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(fiftyTwoWeekBar, 10, LV_PART_MAIN);
+  lv_obj_set_style_radius(fiftyTwoWeekBar, 10, LV_PART_INDICATOR);
   
-  // 52-week low label (on bottom)
+  // 1-month range bar (vertical, right side)
+  oneMonthBar = lv_bar_create(trendPanel);
+  lv_obj_set_size(oneMonthBar, 20, 110);
+  lv_obj_align(oneMonthBar, LV_ALIGN_TOP_RIGHT, -20, 150);
+  lv_bar_set_range(oneMonthBar, 0, 100);
+  lv_bar_set_value(oneMonthBar, 50, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(oneMonthBar, lv_color_hex(0x30363D), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(oneMonthBar, LV_OPA_70, LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(oneMonthBar, lv_color_hex(0x21262D), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(oneMonthBar, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(oneMonthBar, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(oneMonthBar, lv_color_hex(0x8B949E), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(oneMonthBar, 2, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(oneMonthBar, lv_color_hex(0x58A6FF), LV_PART_INDICATOR);  // Blue for 1M
+  lv_obj_set_style_bg_opa(oneMonthBar, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(oneMonthBar, 10, LV_PART_MAIN);
+  lv_obj_set_style_radius(oneMonthBar, 10, LV_PART_INDICATOR);
+  
+  // 52-week low label (on bottom, left side)
   fiftyTwoWeekLowLabel = lv_label_create(trendPanel);
   lv_label_set_text(fiftyTwoWeekLowLabel, "0.00");
   lv_obj_set_style_text_font(fiftyTwoWeekLowLabel, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(fiftyTwoWeekLowLabel, lv_color_hex(0xFF5252), 0);
-  lv_obj_align(fiftyTwoWeekLowLabel, LV_ALIGN_TOP_MID, 0, 290);
+  lv_obj_align(fiftyTwoWeekLowLabel, LV_ALIGN_TOP_LEFT, 12, 265);
+  
+  // 1-month low label (on bottom, right side)
+  oneMonthLowLabel = lv_label_create(trendPanel);
+  lv_label_set_text(oneMonthLowLabel, "0.00");
+  lv_obj_set_style_text_font(oneMonthLowLabel, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(oneMonthLowLabel, lv_color_hex(0xFF5252), 0);
+  lv_obj_align(oneMonthLowLabel, LV_ALIGN_TOP_RIGHT, -12, 265);
   
   // ===== Main content area (shifted right, centered vertically) =====
   // Company name - row 1 (truncate with ... if too long)

@@ -74,7 +74,9 @@
 #define LVGL_PORT_AVOID_TEARING_MODE            (CONFIG_LVGL_PORT_AVOID_TEARING_MODE)
                                                         // Valid if using ESP-IDF
 #else
-#define LVGL_PORT_AVOID_TEARING_MODE            (3)     // Valid if using Arduino
+#define LVGL_PORT_AVOID_TEARING_MODE            (1)     // Valid if using Arduino
+                                                        // Mode 1: double-buffer + full-refresh (more stable)
+                                                        // Mode 3: double-buffer + direct-mode (faster but can have edge artifacts)
 #endif
 
 #if LVGL_PORT_AVOID_TEARING_MODE != 0
