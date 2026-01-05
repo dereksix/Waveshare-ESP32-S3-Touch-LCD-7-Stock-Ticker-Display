@@ -36,9 +36,9 @@
  *      - Lager buffer size can improve FPS, but it will occupy more memory. Maximum buffer size is `width * height`.
  *      - The number of buffers should be 1 or 2.
  */
-#define LVGL_PORT_BUFFER_MALLOC_CAPS            (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)       // Allocate LVGL buffer in SRAM
-// #define LVGL_PORT_BUFFER_MALLOC_CAPS            (MALLOC_CAP_SPIRAM)      // Allocate LVGL buffer in PSRAM
-#define LVGL_PORT_BUFFER_SIZE_HEIGHT            (20)
+#define LVGL_PORT_BUFFER_MALLOC_CAPS            (MALLOC_CAP_SPIRAM)      // Allocate LVGL buffer in PSRAM (8MB available)
+// #define LVGL_PORT_BUFFER_MALLOC_CAPS            (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)       // Allocate LVGL buffer in SRAM
+#define LVGL_PORT_BUFFER_SIZE_HEIGHT            (480)   // Full screen height for maximum stability
 #define LVGL_PORT_BUFFER_NUM                    (2)
 
 /**
@@ -74,9 +74,11 @@
 #define LVGL_PORT_AVOID_TEARING_MODE            (CONFIG_LVGL_PORT_AVOID_TEARING_MODE)
                                                         // Valid if using ESP-IDF
 #else
-#define LVGL_PORT_AVOID_TEARING_MODE            (1)     // Valid if using Arduino
-                                                        // Mode 1: double-buffer + full-refresh (more stable)
-                                                        // Mode 3: double-buffer + direct-mode (faster but can have edge artifacts)
+#define LVGL_PORT_AVOID_TEARING_MODE            (0)     // Valid if using Arduino
+                                                        // Mode 0: NO anti-tear (simplest, uses drawBitmap)
+                                                        // Mode 1: double-buffer + full-refresh
+                                                        // Mode 2: triple-buffer + full-refresh (broke display!)
+                                                        // Mode 3: double-buffer + direct-mode (causes clipping issues)
 #endif
 
 #if LVGL_PORT_AVOID_TEARING_MODE != 0

@@ -5,7 +5,8 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.57"
+#define FIRMWARE_VERSION "1.9.81"
+#define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
 #include <Arduino.h>
@@ -28,6 +29,10 @@
 #include "config.h"
 
 using namespace esp_panel::board;
+
+// WiFi logging to PC
+static WiFiClient wifiLogClient;
+static bool wifiLogConnected = false;
 
 Preferences prefs;
 WiFiUDP ntpUDP;
@@ -611,7 +616,38 @@ lv_obj_t *clockLabel = nullptr;
 static lv_point_t swipeStart;
 static bool swipeTracking = false;
 
-// Cached data for error recovery and market-closed optimization
+// API call tracking (resets on reboot)
+struct ApiStats {
+  uint32_t twelveDataQuoteCalls = 0;      // TwelveData /quote API calls
+  uint32_t twelveDataTimeSeriesCalls = 0; // TwelveData /time_series API calls
+  uint32_t localCacheHits = 0;            // Served from local RAM cache
+  uint32_t p2pCacheHits = 0;              // Served from P2P network
+  uint32_t lastLogTime = 0;               // Last time we logged stats
+};
+static ApiStats apiStats;
+
+// Forward declaration: Prefetched stock data for smooth transitions
+// (Needed here for P2P code, full instance declared later)
+struct PrefetchedData {
+  bool valid;
+  String symbol;
+  float closePrice;
+  float prevClose;
+  float pctChange;
+  float openPrice;
+  float highPrice;
+  float lowPrice;
+  float volume;
+  float fiftyTwoLow;
+  float fiftyTwoHigh;
+  float oneMonthLow;   // 1-month range
+  float oneMonthHigh;
+  String companyName;
+  bool marketOpen;
+};
+
+// Forward declaration: Cached data for error recovery and market-closed optimization
+// (Needed here for P2P code, full instance declared later)
 struct CachedStockData {
   bool valid;
   String symbol;
@@ -626,7 +662,280 @@ struct CachedStockData {
   int dayRangePos, fiftyTwoPos, oneMonthPos;
   bool marketOpen;
   uint32_t fetchTime;  // millis() when data was fetched
-} cachedData = {false};
+};
+
+// Multi-symbol cache for rotation (up to 20 symbols) - declared early for P2P
+extern CachedStockData symbolCache[20];
+extern int symbolCacheCount;
+
+// ============================================================================
+// P2P NETWORK CLIENT
+// ============================================================================
+// Enables multiple devices to share cached stock data via a central registry,
+// reducing TwelveData API calls across the network.
+// ============================================================================
+
+#if defined(P2P_ENABLED) && P2P_ENABLED
+
+#define P2P_HEARTBEAT_INTERVAL_MS 600000    // Send heartbeat every 10 minutes (saves KV writes)
+#define P2P_STOCK_MAX_AGE_SEC 900           // 15 minutes max age
+#define P2P_STOCK_PREFERRED_AGE_SEC 600     // Prefer data < 10 min old
+
+static String p2pNodeId = "";
+static uint32_t lastP2PHeartbeat = 0;
+static bool p2pRegistered = false;
+static int p2pNodesOnline = 0;
+static int p2pStocksCached = 0;
+
+// Generate unique node ID from MAC address
+String getP2PNodeId() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+// Register this device with the P2P registry
+bool p2pRegister() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  p2pNodeId = getP2PNodeId();
+  
+  HTTPClient http;
+  http.begin(String(P2P_REGISTRY_URL) + "/register");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Network-Key", P2P_NETWORK_KEY);
+  http.setTimeout(10000);
+  
+  JsonDocument doc;
+  doc["nodeId"] = p2pNodeId;
+  doc["address"] = WiFi.localIP().toString();
+  doc["firmwareVersion"] = FIRMWARE_VERSION;
+  
+  // Tell registry what symbols we're tracking
+  JsonArray symbols = doc["symbols"].to<JsonArray>();
+  for (int i = 0; i < rotationCount; i++) {
+    symbols.add(rotationSymbols[i]);
+  }
+  if (rotationCount == 0) {
+    symbols.add(currentSymbol);
+  }
+  
+  String body;
+  serializeJson(doc, body);
+  
+  int code = http.POST(body);
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument resp;
+    deserializeJson(resp, payload);
+    p2pNodesOnline = resp["nodesOnline"] | 0;
+    p2pRegistered = true;
+    Serial.printf("[P2P] Registered as %s (%d nodes online)\n", p2pNodeId.c_str(), p2pNodesOnline);
+  } else {
+    Serial.printf("[P2P] Registration failed: %d\n", code);
+  }
+  
+  http.end();
+  return p2pRegistered;
+}
+
+// Send heartbeat and push cached stock data to registry
+bool p2pHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  // Re-register if needed
+  if (!p2pRegistered) {
+    return p2pRegister();
+  }
+  
+  HTTPClient http;
+  http.begin(String(P2P_REGISTRY_URL) + "/heartbeat");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Network-Key", P2P_NETWORK_KEY);
+  http.setTimeout(10000);
+  
+  JsonDocument doc;
+  doc["nodeId"] = p2pNodeId;
+  
+  // Push cached stock data
+  JsonObject stockData = doc["stockData"].to<JsonObject>();
+  uint32_t now = millis();
+  
+  for (int i = 0; i < symbolCacheCount; i++) {
+    if (!symbolCache[i].valid) continue;
+    
+    // Only push data less than 10 minutes old
+    uint32_t ageMs = now - symbolCache[i].fetchTime;
+    if (ageMs > (P2P_STOCK_MAX_AGE_SEC * 1000)) continue;
+    
+    JsonObject stock = stockData[symbolCache[i].symbol].to<JsonObject>();
+    stock["price"] = symbolCache[i].priceStr;
+    stock["change"] = symbolCache[i].changeStr;
+    stock["dollarChange"] = symbolCache[i].dollarChangeStr;
+    stock["volume"] = symbolCache[i].volumeStr;
+    stock["ohl"] = symbolCache[i].ohlStr;
+    stock["name"] = symbolCache[i].companyName;
+    stock["low"] = symbolCache[i].low;
+    stock["high"] = symbolCache[i].high;
+    stock["fiftyTwoLow"] = symbolCache[i].fiftyTwoLow;
+    stock["fiftyTwoHigh"] = symbolCache[i].fiftyTwoHigh;
+    stock["oneMonthLow"] = symbolCache[i].oneMonthLow;
+    stock["oneMonthHigh"] = symbolCache[i].oneMonthHigh;
+    stock["marketOpen"] = symbolCache[i].marketOpen;
+    stock["timestamp"] = timeClient.getEpochTime() - (ageMs / 1000);
+  }
+  
+  String body;
+  serializeJson(doc, body);
+  
+  int code = http.POST(body);
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument resp;
+    deserializeJson(resp, payload);
+    p2pNodesOnline = resp["nodesOnline"] | p2pNodesOnline;
+    p2pStocksCached = resp["stocksCached"] | p2pStocksCached;
+    Serial.printf("[P2P] Heartbeat OK (%d nodes, %d stocks)\n", p2pNodesOnline, p2pStocksCached);
+  } else if (code == 404) {
+    // Node expired, re-register
+    p2pRegistered = false;
+    Serial.println("[P2P] Node expired, will re-register");
+  } else {
+    Serial.printf("[P2P] Heartbeat failed: %d\n", code);
+  }
+  
+  http.end();
+  return (code == 200);
+}
+
+// Try to fetch stock data from P2P network
+bool p2pFetchStock(const String& symbol, PrefetchedData& outData) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  HTTPClient http;
+  http.begin(String(P2P_REGISTRY_URL) + "/stock/" + symbol);
+  http.addHeader("X-Network-Key", P2P_NETWORK_KEY);
+  http.setTimeout(8000);
+  
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    http.end();
+    
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    
+    if (err || !doc["found"].as<bool>()) {
+      Serial.printf("[P2P] No data for %s in network\n", symbol.c_str());
+      return false;
+    }
+    
+    int ageSeconds = doc["ageSeconds"] | 9999;
+    
+    // Reject if too old
+    if (ageSeconds > P2P_STOCK_MAX_AGE_SEC) {
+      Serial.printf("[P2P] Data for %s too old (%ds)\n", symbol.c_str(), ageSeconds);
+      return false;
+    }
+    
+    JsonObject data = doc["data"];
+    
+    // Parse the data into PrefetchedData
+    outData.symbol = symbol;
+    outData.companyName = data["name"].as<String>();
+    outData.marketOpen = data["marketOpen"] | false;
+    outData.lowPrice = data["low"] | 0.0f;
+    outData.highPrice = data["high"] | 0.0f;
+    outData.fiftyTwoLow = data["fiftyTwoLow"] | 0.0f;
+    outData.fiftyTwoHigh = data["fiftyTwoHigh"] | 0.0f;
+    outData.oneMonthLow = data["oneMonthLow"] | 0.0f;
+    outData.oneMonthHigh = data["oneMonthHigh"] | 0.0f;
+    
+    // Parse price string (e.g., "$485.92")
+    String priceStr = data["price"].as<String>();
+    priceStr.replace("$", "");
+    priceStr.replace(",", "");
+    outData.closePrice = priceStr.toFloat();
+    
+    // Parse percent change (e.g., "+0.40%" or "-1.23%")
+    String pctStr = data["change"].as<String>();
+    pctStr.replace("%", "");
+    pctStr.replace("+", "");
+    outData.pctChange = pctStr.toFloat();
+    
+    // Parse dollar change to get prevClose
+    String dollarStr = data["dollarChange"].as<String>();
+    dollarStr.replace("$", "");
+    dollarStr.replace("+", "");
+    float dollarChange = dollarStr.toFloat();
+    outData.prevClose = outData.closePrice - dollarChange;
+    
+    // Parse OHL string for open price
+    String ohlStr = data["ohl"].as<String>();
+    int oIdx = ohlStr.indexOf("O: ");
+    int hIdx = ohlStr.indexOf("H: ");
+    if (oIdx >= 0 && hIdx > oIdx) {
+      outData.openPrice = ohlStr.substring(oIdx + 3, hIdx).toFloat();
+    }
+    
+    // Parse volume
+    String volStr = data["volume"].as<String>();
+    volStr.replace("Vol: ", "");
+    float volMult = 1.0f;
+    if (volStr.endsWith("B")) { volMult = 1e9; volStr.replace("B", ""); }
+    else if (volStr.endsWith("M")) { volMult = 1e6; volStr.replace("M", ""); }
+    else if (volStr.endsWith("K")) { volMult = 1e3; volStr.replace("K", ""); }
+    outData.volume = volStr.toFloat() * volMult;
+    
+    outData.valid = true;
+    
+    Serial.printf("[P2P] Got %s from network (age: %ds)\n", symbol.c_str(), ageSeconds);
+    return true;
+  }
+  
+  http.end();
+  return false;
+}
+
+// P2P tick - call this in main loop
+void p2pTick() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  uint32_t now = millis();
+  
+  // Initial registration
+  if (!p2pRegistered) {
+    p2pRegister();
+    lastP2PHeartbeat = now;
+    return;
+  }
+  
+  // Periodic heartbeat
+  if ((now - lastP2PHeartbeat) >= P2P_HEARTBEAT_INTERVAL_MS) {
+    p2pHeartbeat();
+    lastP2PHeartbeat = now;
+  }
+}
+
+#else
+// P2P disabled stubs
+inline void p2pTick() {}
+inline bool p2pFetchStock(const String& symbol, PrefetchedData& outData) { return false; }
+#endif // P2P_ENABLED
+
+// ============================================================================
+// END P2P NETWORK CLIENT
+// ============================================================================
+
+// CachedStockData struct is defined earlier (before P2P code)
+// Declare instances here
+CachedStockData cachedData = {false};
 
 // Multi-symbol cache for rotation (up to 20 symbols)
 CachedStockData symbolCache[20];
@@ -696,24 +1005,8 @@ bool isNearMarketTransition() {
   return false;
 }
 
-// Prefetched stock data for smooth transitions
-struct PrefetchedData {
-  bool valid;
-  String symbol;
-  float closePrice;
-  float prevClose;
-  float pctChange;
-  float openPrice;
-  float highPrice;
-  float lowPrice;
-  float volume;
-  float fiftyTwoLow;
-  float fiftyTwoHigh;
-  float oneMonthLow;   // 1-month range
-  float oneMonthHigh;
-  String companyName;
-  bool marketOpen;
-};
+// PrefetchedData struct is defined earlier (before P2P code)
+// Just declare the instance here
 PrefetchedData prefetchedStock = {false};
 
 // 1-Month data cache (per symbol, fetched once daily)
@@ -743,8 +1036,10 @@ bool pendingWifiConnect = false;
 bool pendingShowKeyboard = false;
 int pendingNetworkIndex = -1;
 
-// API Key - stored in Preferences, falls back to config.h
-String apiKey = "";  // Loaded from Preferences on startup
+// API Keys - stored in Preferences, falls back to config.h
+String apiKey = "";          // TwelveData API key - for company data, 52-week range
+String finnhubApiKey = "";   // Finnhub API key - PRIMARY for quotes (60 calls/min)
+String polygonApiKey = "";   // Polygon API key - FALLBACK for quotes (5 calls/min)
 
 // Tickers
 const char* tickers[] = {"MSFT", "AAPL", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "SPY", "QQQ"};
@@ -776,8 +1071,152 @@ void parseRotationList() {
 // Forward declaration
 bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
 
+// Finnhub API fetch - used as fallback when TwelveData fails or rate-limited
+// Returns true if successful, fills prefetchedStock with data
+bool fetchFromFinnhub(const String& symbol) {
+  if (finnhubApiKey.length() == 0) {
+    Serial.println("[FINNHUB] No API key configured");
+    return false;
+  }
+  
+  Serial.printf("[FINNHUB] Fetching quote for %s\n", symbol.c_str());
+  HTTPClient http;
+  
+  // Finnhub quote endpoint
+  String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + finnhubApiKey;
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  
+  if (code != 200) {
+    Serial.printf("[FINNHUB] HTTP error: %d\n", code);
+    http.end();
+    return false;
+  }
+  
+  String payload = http.getString();
+  http.end();
+  
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[FINNHUB] JSON parse error: %s\n", err.c_str());
+    return false;
+  }
+  
+  // Finnhub returns: c=current, h=high, l=low, o=open, pc=previous close, t=timestamp
+  float currentPrice = doc["c"] | 0.0f;
+  float prevClose = doc["pc"] | 0.0f;
+  
+  if (currentPrice == 0.0f) {
+    Serial.println("[FINNHUB] Invalid response - no price data");
+    return false;
+  }
+  
+  // Calculate percent change
+  float pctChange = 0.0f;
+  if (prevClose > 0) {
+    pctChange = ((currentPrice - prevClose) / prevClose) * 100.0f;
+  }
+  
+  prefetchedStock.symbol = symbol;
+  prefetchedStock.closePrice = currentPrice;
+  prefetchedStock.prevClose = prevClose;
+  prefetchedStock.pctChange = pctChange;
+  prefetchedStock.openPrice = doc["o"] | 0.0f;
+  prefetchedStock.highPrice = doc["h"] | 0.0f;
+  prefetchedStock.lowPrice = doc["l"] | 0.0f;
+  prefetchedStock.volume = 0.0;  // Finnhub quote doesn't include volume
+  prefetchedStock.companyName = "";  // Would need separate API call
+  prefetchedStock.marketOpen = true;  // Finnhub doesn't return this directly
+  prefetchedStock.fiftyTwoLow = 0.0f;  // Would need separate API call
+  prefetchedStock.fiftyTwoHigh = 0.0f;
+  prefetchedStock.oneMonthLow = 0.0f;
+  prefetchedStock.oneMonthHigh = 0.0f;
+  prefetchedStock.valid = true;
+  
+  Serial.printf("[FINNHUB] Success: %s = $%.2f (%.2f%%)\n", 
+                symbol.c_str(), currentPrice, pctChange);
+  return true;
+}
+
+// Fetch quote from Polygon.io API (5 calls/min free tier)
+bool fetchFromPolygon(const String& symbol) {
+  if (polygonApiKey.length() == 0) {
+    Serial.println("[POLYGON] No API key configured");
+    return false;
+  }
+  
+  Serial.printf("[POLYGON] Fetching quote for %s\n", symbol.c_str());
+  HTTPClient http;
+  
+  // Polygon previous day endpoint (free tier)
+  String url = "https://api.polygon.io/v2/aggs/ticker/" + symbol + "/prev?adjusted=true&apiKey=" + polygonApiKey;
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  
+  if (code != 200) {
+    Serial.printf("[POLYGON] HTTP error: %d\n", code);
+    http.end();
+    return false;
+  }
+  
+  String payload = http.getString();
+  http.end();
+  
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[POLYGON] JSON parse error: %s\n", err.c_str());
+    return false;
+  }
+  
+  // Polygon returns: results[0].c=close, h=high, l=low, o=open, v=volume, vw=vwap
+  JsonArray results = doc["results"];
+  if (results.size() == 0) {
+    Serial.println("[POLYGON] No results returned");
+    return false;
+  }
+  
+  JsonObject result = results[0];
+  float closePrice = result["c"] | 0.0f;
+  float openPrice = result["o"] | 0.0f;
+  
+  if (closePrice == 0.0f) {
+    Serial.println("[POLYGON] Invalid response - no price data");
+    return false;
+  }
+  
+  // Calculate percent change from open
+  float pctChange = 0.0f;
+  if (openPrice > 0) {
+    pctChange = ((closePrice - openPrice) / openPrice) * 100.0f;
+  }
+  
+  prefetchedStock.symbol = symbol;
+  prefetchedStock.closePrice = closePrice;
+  prefetchedStock.prevClose = openPrice;  // Use open as prev close
+  prefetchedStock.pctChange = pctChange;
+  prefetchedStock.openPrice = openPrice;
+  prefetchedStock.highPrice = result["h"] | 0.0f;
+  prefetchedStock.lowPrice = result["l"] | 0.0f;
+  prefetchedStock.volume = result["v"] | 0.0;
+  prefetchedStock.companyName = "";
+  prefetchedStock.marketOpen = false;  // prev endpoint = market was closed
+  prefetchedStock.fiftyTwoLow = 0.0f;
+  prefetchedStock.fiftyTwoHigh = 0.0f;
+  prefetchedStock.oneMonthLow = 0.0f;
+  prefetchedStock.oneMonthHigh = 0.0f;
+  prefetchedStock.valid = true;
+  
+  Serial.printf("[POLYGON] Success: %s = $%.2f (%.2f%%)\n", 
+                symbol.c_str(), closePrice, pctChange);
+  return true;
+}
+
 // Prefetch stock data for a symbol (for smooth rotation)
-// Uses cached data when market is closed to save API calls
+// Uses P2P network first, then cached data when market closed, then Finnhub API (primary), then TwelveData (fallback)
 bool prefetchStockData(const String& symbol) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -788,12 +1227,14 @@ bool prefetchStockData(const String& symbol) {
   // - The local time is outside regular market hours.
   bool treatAsClosedForCache = (!isMarketOpen) || (!isRegularMarketHoursByTime());
 
-  // Check if market is closed and we have cached data for this symbol
+  // Step 1: Check local cache first (instant, no network)
   if (treatAsClosedForCache) {
     CachedStockData* cached = findCachedSymbol(symbol);
     if (cached != nullptr && cached->valid) {
       // Use cached data - no API call needed!
-      Serial.printf("Market closed (cache) - using cached data for %s\n", symbol.c_str());
+      apiStats.localCacheHits++;
+      Serial.printf("[CACHE] Local cache hit for %s (total: %u cache, %u API)\n", 
+                    symbol.c_str(), apiStats.localCacheHits, apiStats.twelveDataQuoteCalls);
       
       // Convert cached display data back to prefetchedStock
       // We need to parse the cached strings back to values
@@ -848,10 +1289,37 @@ bool prefetchStockData(const String& symbol) {
       prefetchedStock.valid = true;
       return true;
     }
-    // No cached data - need to fetch once even when closed
-    Serial.printf("Market closed but no cache for %s - fetching once\n", symbol.c_str());
+    // No cached data - will try P2P or fetch from API
+    Serial.printf("Market closed but no local cache for %s\n", symbol.c_str());
   }
   
+  #if defined(P2P_ENABLED) && P2P_ENABLED
+  {
+    PrefetchedData p2pData = {false};
+    if (p2pFetchStock(symbol, p2pData)) {
+      prefetchedStock = p2pData;
+      apiStats.p2pCacheHits++;
+      Serial.printf("[P2P] Network hit for %s (total: %u P2P, %u API)\n", 
+                    symbol.c_str(), apiStats.p2pCacheHits, apiStats.twelveDataQuoteCalls);
+      return true;
+    }
+    Serial.printf("[P2P] No network data for %s - trying Finnhub API\n", symbol.c_str());
+  }
+  #endif
+  
+  // Step 3: Try Finnhub API first (primary - 60 calls/min)
+  if (finnhubApiKey.length() > 0) {
+    if (fetchFromFinnhub(symbol)) {
+      Serial.printf("[FINNHUB] Primary API success for %s\n", symbol.c_str());
+      return true;
+    }
+    Serial.printf("[FINNHUB] Failed for %s - trying TwelveData fallback\n", symbol.c_str());
+  }
+  
+  // Step 4: Fetch from TwelveData API (fallback)
+  apiStats.twelveDataQuoteCalls++;
+  Serial.printf("[API] TwelveData /quote for %s (call #%u today)\n", 
+                symbol.c_str(), apiStats.twelveDataQuoteCalls);
   HTTPClient http;
   String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + apiKey;
   
@@ -906,6 +1374,17 @@ bool prefetchStockData(const String& symbol) {
   }
   
   http.end();
+  
+  // Step 5: TwelveData also failed - try Polygon as last resort
+  Serial.printf("[API] TwelveData fallback also failed for %s (HTTP %d) - trying Polygon\n", symbol.c_str(), code);
+  
+  if (fetchFromPolygon(symbol)) {
+    return true;
+  }
+  
+  // All APIs failed - no data available
+  Serial.printf("[API] All APIs failed for %s\n", symbol.c_str());
+  
   prefetchedStock.valid = false;
   return false;
 }
@@ -963,6 +1442,9 @@ bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh) {
   }
   
   // Need to fetch - get 22 trading days of daily data
+  apiStats.twelveDataTimeSeriesCalls++;
+  Serial.printf("[API] TwelveData /time_series for %s (call #%u today)\n", 
+                symbol.c_str(), apiStats.twelveDataTimeSeriesCalls);
   HTTPClient http;
   String url = "https://api.twelvedata.com/time_series?symbol=" + symbol + 
                "&interval=1day&outputsize=22&apikey=" + apiKey;
@@ -1160,6 +1642,107 @@ void fetchPrice() {
     return;
   }
   
+  // Try Finnhub first (primary API - 60 calls/min)
+  if (finnhubApiKey.length() > 0) {
+    Serial.printf("[FINNHUB] Trying primary API for %s\\n", currentSymbol.c_str());
+    HTTPClient finnhubHttp;
+    String finnhubUrl = "https://finnhub.io/api/v1/quote?symbol=" + currentSymbol + "&token=" + finnhubApiKey;
+    finnhubHttp.begin(finnhubUrl);
+    finnhubHttp.setTimeout(5000);
+    int finnhubCode = finnhubHttp.GET();
+    
+    if (finnhubCode == 200) {
+      String payload = finnhubHttp.getString();
+      finnhubHttp.end();
+      
+      JsonDocument doc;
+      deserializeJson(doc, payload);
+      
+      float closePrice = doc["c"] | 0.0f;
+      float prevClose = doc["pc"] | 0.0f;
+      float highPrice = doc["h"] | 0.0f;
+      float lowPrice = doc["l"] | 0.0f;
+      float openPrice = doc["o"] | 0.0f;
+      
+      if (closePrice > 0) {
+        float pctChange = 0.0f;
+        if (prevClose > 0) {
+          pctChange = ((closePrice - prevClose) / prevClose) * 100.0f;
+        }
+        float dollarChange = closePrice - prevClose;
+        
+        char priceBuf[16], pctBuf[16], dollarBuf[16];
+        snprintf(priceBuf, sizeof(priceBuf), "$%.2f", closePrice);
+        snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", pctChange);
+        snprintf(dollarBuf, sizeof(dollarBuf), "%+.2f", dollarChange);
+        
+        char ohlBuf[48];
+        snprintf(ohlBuf, sizeof(ohlBuf), "O: %.2f   H: %.2f   L: %.2f", openPrice, highPrice, lowPrice);
+        
+        lastPrice = String(priceBuf);
+        lastChange = String(pctBuf);
+        lastDollarChange = String(dollarBuf);
+        
+        // Calculate range bar position
+        int rangePos = 50;
+        if (highPrice > lowPrice) {
+          rangePos = (int)(((closePrice - lowPrice) / (highPrice - lowPrice)) * 100);
+          if (rangePos < 0) rangePos = 0;
+          if (rangePos > 100) rangePos = 100;
+        }
+        
+        // Get timestamp
+        timeClient.update();
+        int hour = timeClient.getHours();
+        int minute = timeClient.getMinutes();
+        char timeBuf[64];
+        int hour12 = hour % 12;
+        if (hour12 == 0) hour12 = 12;
+        snprintf(timeBuf, sizeof(timeBuf), "Last Updated: %d:%02d %s  |  Finnhub", hour12, minute, hour >= 12 ? "PM" : "AM");
+        
+        char lowBuf[12], highBuf2[12];
+        snprintf(lowBuf, sizeof(lowBuf), "%.2f", lowPrice);
+        snprintf(highBuf2, sizeof(highBuf2), "%.2f", highPrice);
+        
+        if (lvgl_port_lock(100)) {
+          lv_label_set_text(priceLabel, priceBuf);
+          lv_label_set_text(changeLabel, pctBuf);
+          lv_label_set_text(dollarChangeLabel, dollarBuf);
+          lv_obj_set_style_text_color(changeLabel, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+          lv_obj_set_style_text_color(dollarChangeLabel, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+          lv_label_set_text(ohlLabel, ohlBuf);
+          lv_bar_set_value(rangeBar, rangePos, LV_ANIM_OFF);
+          lv_label_set_text(rangeLowLabel, lowBuf);
+          lv_label_set_text(rangeHighLabel, highBuf2);
+          lv_label_set_text(statusLabel, timeBuf);
+          
+          // Update trend arrow
+          if (trendArrow) {
+            lv_label_set_text(trendArrow, pctChange >= 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+            lv_obj_set_style_text_color(trendArrow, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+          }
+          
+          if (trendPanel) lv_obj_invalidate(trendPanel);
+          lvgl_port_unlock();
+        }
+        
+        Serial.printf("[FINNHUB] Success: %s = $%.2f (%.2f%%)\\n", currentSymbol.c_str(), closePrice, pctChange);
+        
+        prefs.begin("stock", false);
+        prefs.putString("symbol", currentSymbol);
+        prefs.putString("price", lastPrice);
+        prefs.end();
+        return;
+      }
+    }
+    finnhubHttp.end();
+    Serial.printf("[FINNHUB] Failed (HTTP %d) - trying TwelveData fallback\\n", finnhubCode);
+  }
+  
+  // Fallback to TwelveData
+  apiStats.twelveDataQuoteCalls++;
+  Serial.printf("[API] TwelveData /quote (fallback) for %s (call #%u today)\\n", 
+                currentSymbol.c_str(), apiStats.twelveDataQuoteCalls);
   HTTPClient http;
   String url = "https://api.twelvedata.com/quote?symbol=" + currentSymbol + "&apikey=" + apiKey;
   
@@ -1344,7 +1927,113 @@ void fetchPrice() {
     prefs.putString("price", lastPrice);
     prefs.end();
   } else {
-    // API error - show cached data if available
+    // TwelveData fallback also failed - try Polygon as last resort
+    http.end();
+    Serial.printf("[API] TwelveData fallback also failed (HTTP %d) - trying Polygon\\n", code);
+    
+    if (polygonApiKey.length() > 0) {
+      HTTPClient polygonHttp;
+      String polygonUrl = "https://api.polygon.io/v2/aggs/ticker/" + currentSymbol + "/prev?adjusted=true&apiKey=" + polygonApiKey;
+      polygonHttp.begin(polygonUrl);
+      polygonHttp.setTimeout(5000);
+      int polygonCode = polygonHttp.GET();
+      
+      if (polygonCode == 200) {
+        String payload = polygonHttp.getString();
+        polygonHttp.end();
+        
+        JsonDocument doc;
+        deserializeJson(doc, payload);
+        
+        JsonArray results = doc["results"];
+        if (results.size() > 0) {
+          JsonObject result = results[0];
+          float closePrice = result["c"] | 0.0f;
+          float openPrice = result["o"] | 0.0f;
+          float highPrice = result["h"] | 0.0f;
+          float lowPrice = result["l"] | 0.0f;
+          float volume = result["v"] | 0.0;
+          
+          if (closePrice > 0) {
+            float pctChange = 0.0f;
+            if (openPrice > 0) {
+              pctChange = ((closePrice - openPrice) / openPrice) * 100.0f;
+            }
+            float dollarChange = closePrice - openPrice;
+            
+            char priceBuf[16], pctBuf[16], dollarBuf[16];
+            snprintf(priceBuf, sizeof(priceBuf), "$%.2f", closePrice);
+            snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", pctChange);
+            snprintf(dollarBuf, sizeof(dollarBuf), "%+.2f", dollarChange);
+            
+            char ohlBuf[48];
+            snprintf(ohlBuf, sizeof(ohlBuf), "O: %.2f   H: %.2f   L: %.2f", openPrice, highPrice, lowPrice);
+            
+            char volBuf[24];
+            if (volume >= 1e9) snprintf(volBuf, sizeof(volBuf), "Vol: %.2fB", volume / 1e9);
+            else if (volume >= 1e6) snprintf(volBuf, sizeof(volBuf), "Vol: %.2fM", volume / 1e6);
+            else if (volume >= 1e3) snprintf(volBuf, sizeof(volBuf), "Vol: %.1fK", volume / 1e3);
+            else snprintf(volBuf, sizeof(volBuf), "Vol: %.0f", volume);
+            
+            lastPrice = String(priceBuf);
+            lastChange = String(pctBuf);
+            lastDollarChange = String(dollarBuf);
+            
+            int rangePos = 50;
+            if (highPrice > lowPrice) {
+              rangePos = (int)(((closePrice - lowPrice) / (highPrice - lowPrice)) * 100);
+              if (rangePos < 0) rangePos = 0;
+              if (rangePos > 100) rangePos = 100;
+            }
+            
+            timeClient.update();
+            int hour = timeClient.getHours();
+            int minute = timeClient.getMinutes();
+            char timeBuf[64];
+            int hour12 = hour % 12;
+            if (hour12 == 0) hour12 = 12;
+            snprintf(timeBuf, sizeof(timeBuf), "Last Updated: %d:%02d %s  |  Polygon", hour12, minute, hour >= 12 ? "PM" : "AM");
+            
+            char lowBuf[12], highBuf2[12];
+            snprintf(lowBuf, sizeof(lowBuf), "%.2f", lowPrice);
+            snprintf(highBuf2, sizeof(highBuf2), "%.2f", highPrice);
+            
+            if (lvgl_port_lock(100)) {
+              lv_label_set_text(priceLabel, priceBuf);
+              lv_label_set_text(changeLabel, pctBuf);
+              lv_label_set_text(dollarChangeLabel, dollarBuf);
+              lv_obj_set_style_text_color(changeLabel, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+              lv_obj_set_style_text_color(dollarChangeLabel, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+              lv_label_set_text(ohlLabel, ohlBuf);
+              lv_label_set_text(volumeLabel, volBuf);
+              lv_bar_set_value(rangeBar, rangePos, LV_ANIM_OFF);
+              lv_label_set_text(rangeLowLabel, lowBuf);
+              lv_label_set_text(rangeHighLabel, highBuf2);
+              lv_label_set_text(statusLabel, timeBuf);
+              
+              if (trendArrow) {
+                lv_label_set_text(trendArrow, pctChange >= 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+                lv_obj_set_style_text_color(trendArrow, pctChange >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252), 0);
+              }
+              if (trendPanel) lv_obj_invalidate(trendPanel);
+              lvgl_port_unlock();
+            }
+            
+            Serial.printf("[POLYGON] Success: %s = $%.2f (%.2f%%)\\n", currentSymbol.c_str(), closePrice, pctChange);
+            
+            prefs.begin("stock", false);
+            prefs.putString("symbol", currentSymbol);
+            prefs.putString("price", lastPrice);
+            prefs.end();
+            return;
+          }
+        }
+      }
+      polygonHttp.end();
+      Serial.printf("[POLYGON] Also failed (HTTP %d)\\n", polygonCode);
+    }
+    
+    // All APIs failed - show cached data if available
     if (lvgl_port_lock(100)) {
       if (cachedData.valid && cachedData.symbol == currentSymbol) {
         lv_label_set_text(statusLabel, "Cached (API Error)");
@@ -1354,9 +2043,12 @@ void fetchPrice() {
       lv_obj_invalidate(statusLabel);
       lvgl_port_unlock();
     }
+    return;
   }
   http.end();
 }
+
+// WiFi logging will be added after fixing compile error
 
 // ============ EVENT CALLBACKS - Only set flags ============
 
@@ -1408,6 +2100,8 @@ static void custom_symbol_go_cb(lv_event_t *e) {
     }
   }
 }
+
+
 
 static void custom_symbol_ta_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
@@ -2017,31 +2711,81 @@ void checkGitHubOTA() {
 }
 
 // ============ OTA UPDATE WEB SERVER ============
-const char* otaPagePart1 = R"rawliteral(
+// Dynamic page builder for API keys
+String buildOtaPage() {
+  // Mask TwelveData key
+  String maskedKey = "";
+  if (apiKey.length() > 4) {
+    maskedKey = apiKey.substring(0, 4) + "****" + apiKey.substring(apiKey.length() - 4);
+  } else if (apiKey.length() > 0) {
+    maskedKey = "****";
+  }
+  
+  // Mask Finnhub key
+  String maskedFinnhub = "";
+  if (finnhubApiKey.length() > 4) {
+    maskedFinnhub = finnhubApiKey.substring(0, 4) + "****" + finnhubApiKey.substring(finnhubApiKey.length() - 4);
+  } else if (finnhubApiKey.length() > 0) {
+    maskedFinnhub = "****";
+  }
+  
+  // Mask Polygon key
+  String maskedPolygon = "";
+  if (polygonApiKey.length() > 4) {
+    maskedPolygon = polygonApiKey.substring(0, 4) + "****" + polygonApiKey.substring(polygonApiKey.length() - 4);
+  } else if (polygonApiKey.length() > 0) {
+    maskedPolygon = "****";
+  }
+  
+  String page = R"rawliteral(
 <!DOCTYPE html><html><head><title>Stock Ticker</title>
 <style>
 body{font-family:Arial;background:#0D1117;color:#C9D1D9;text-align:center;padding:30px}
-h1{color:#58A6FF;margin-bottom:5px}h2{color:#8B949E;font-size:18px;margin-top:30px}
-.section{background:#161B22;border-radius:10px;padding:20px;margin:15px auto;max-width:400px}
-input[type=text]{background:#0D1117;border:1px solid #30363D;color:#C9D1D9;padding:10px;border-radius:6px;width:250px}
+h1{color:#58A6FF;margin-bottom:5px}h2{color:#8B949E;font-size:18px;margin-top:20px}
+.section{background:#161B22;border-radius:10px;padding:20px;margin:15px auto;max-width:450px}
+input[type=text]{background:#0D1117;border:1px solid #30363D;color:#C9D1D9;padding:10px;border-radius:6px;width:280px;margin:5px 0}
 input[type=file]{margin:10px}
-input[type=submit]{background:#238636;color:#fff;padding:12px 25px;border:none;border-radius:6px;cursor:pointer;margin-top:10px}
+input[type=submit]{background:#238636;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;margin:8px 5px}
 input[type=submit]:hover{background:#2EA043}
 .version{color:#8B949E;font-size:14px}
+.label{color:#8B949E;font-size:12px;margin-top:10px}
+.primary{color:#00E676}
+.fallback{color:#FFA726}
 </style></head>
 <body><h1>Stock Ticker</h1><p class='version'>v)rawliteral" FIRMWARE_VERSION R"rawliteral(</p>
-<div class='section'><h2>API Key</h2>
-<form method='POST' action='/apikey'>
-<input type='text' name='key' placeholder='Enter TwelveData API Key' value=')rawliteral";
+<div class='section'>
+<h2>Finnhub API Key <span class='primary'>● PRIMARY</span></h2>
+<p class='label'>60 calls/min - Used for real-time quotes</p>
+<form method='POST' action='/finnhubkey'>
+<input type='text' name='key' placeholder='Finnhub API Key' value=')rawliteral";
+  page += maskedFinnhub;
+  page += R"rawliteral(' maxlength='40'>
+<input type='submit' value='Save'></form>
 
-const char* otaPagePart2 = R"rawliteral(' maxlength='32'><br>
-<input type='submit' value='Save API Key'></form></div>
+<h2>TwelveData API Key</h2>
+<p class='label'>800 calls/day - Used for company data, 52-week range</p>
+<form method='POST' action='/apikey'>
+<input type='text' name='key' placeholder='TwelveData API Key' value=')rawliteral";
+  page += maskedKey;
+  page += R"rawliteral(' maxlength='40'>
+<input type='submit' value='Save'></form>
+
+<h2>Polygon API Key <span class='fallback'>● FALLBACK</span></h2>
+<p class='label'>5 calls/min - Used when other APIs fail</p>
+<form method='POST' action='/polygonkey'>
+<input type='text' name='key' placeholder='Polygon API Key' value=')rawliteral";
+  page += maskedPolygon;
+  page += R"rawliteral(' maxlength='40'>
+<input type='submit' value='Save'></form>
+</div>
 <div class='section'><h2>Firmware Update</h2>
 <form method='POST' action='/update' enctype='multipart/form-data'>
 <input type='file' name='update' accept='.bin' required><br>
 <input type='submit' value='Upload Firmware'></form></div>
 </body></html>
 )rawliteral";
+  return page;
+}
 
 void handleOTAUpload() {
   HTTPUpload& upload = otaServer.upload();
@@ -2071,28 +2815,54 @@ void setupOTA() {
   }
   
   otaServer.on("/", HTTP_GET, []() {
-    // Build page with current API key (masked)
-    String maskedKey = "";
-    if (apiKey.length() > 4) {
-      maskedKey = apiKey.substring(0, 4) + "****" + apiKey.substring(apiKey.length() - 4);
-    } else if (apiKey.length() > 0) {
-      maskedKey = "****";
-    }
-    String page = String(otaPagePart1) + maskedKey + String(otaPagePart2);
-    otaServer.send(200, "text/html", page);
+    otaServer.send(200, "text/html", buildOtaPage());
   });
   
   otaServer.on("/apikey", HTTP_POST, []() {
     if (otaServer.hasArg("key")) {
       String newKey = otaServer.arg("key");
-      if (newKey.length() > 0) {
+      if (newKey.length() > 0 && newKey.indexOf("****") == -1) {  // Don't save masked value
         apiKey = newKey;
         Preferences prefs;
         prefs.begin("stock", false);
         prefs.putString("apikey", apiKey);
         prefs.end();
-        Serial.println("API key updated via web");
-        otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>API Key Saved!</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+        Serial.println("TwelveData API key updated via web");
+        otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>TwelveData Key Saved!</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+        return;
+      }
+    }
+    otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#FF5252;text-align:center;padding:50px'><h1>Invalid Key</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+  });
+  
+  otaServer.on("/finnhubkey", HTTP_POST, []() {
+    if (otaServer.hasArg("key")) {
+      String newKey = otaServer.arg("key");
+      if (newKey.length() > 0 && newKey.indexOf("****") == -1) {  // Don't save masked value
+        finnhubApiKey = newKey;
+        Preferences prefs;
+        prefs.begin("stock", false);
+        prefs.putString("finnhubkey", finnhubApiKey);
+        prefs.end();
+        Serial.println("Finnhub API key updated via web");
+        otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>Finnhub Key Saved!</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+        return;
+      }
+    }
+    otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#FF5252;text-align:center;padding:50px'><h1>Invalid Key</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+  });
+  
+  otaServer.on("/polygonkey", HTTP_POST, []() {
+    if (otaServer.hasArg("key")) {
+      String newKey = otaServer.arg("key");
+      if (newKey.length() > 0 && newKey.indexOf("****") == -1) {  // Don't save masked value
+        polygonApiKey = newKey;
+        Preferences prefs;
+        prefs.begin("stock", false);
+        prefs.putString("polygonkey", polygonApiKey);
+        prefs.end();
+        Serial.println("Polygon API key updated via web");
+        otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#00E676;text-align:center;padding:50px'><h1>Polygon Key Saved!</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
         return;
       }
     }
@@ -2133,9 +2903,9 @@ void setup() {
 #if ESP_PANEL_DRIVERS_BUS_ENABLE_RGB && defined(CONFIG_IDF_TARGET_ESP32S3)
       auto *lcd_bus = lcd_pre->getBus();
       if (lcd_bus && lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
-        // Use bounce buffer to reduce rare long-run RGB artifacts.
-        // Keep the multiplier conservative to avoid flicker.
-        static_cast<esp_panel::drivers::BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd_pre->getFrameWidth() * 10);
+        // DISABLED: Testing if bounce buffer causes left-side artifacts
+        // Set to 0 to use direct PSRAM access without bounce buffer
+        static_cast<esp_panel::drivers::BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(0);
       }
 #endif
     }
@@ -2456,14 +3226,38 @@ void setup() {
   prefs.begin("stock", true);
   currentSymbol = prefs.getString("symbol", "MSFT");
   lastPrice = prefs.getString("price", "N/A");
-  // Load API key - fall back to compiled key if not saved
+  // Load TwelveData API key - fall back to compiled key if not saved
   apiKey = prefs.getString("apikey", "");
   if (apiKey.length() == 0) {
     apiKey = TWELVEDATA_API_KEY;  // Fall back to compiled config
   }
+  // Load Finnhub API key - fall back to compiled key if not saved
+  finnhubApiKey = prefs.getString("finnhubkey", "");
+  if (finnhubApiKey.length() == 0) {
+    #ifdef FINNHUB_API_KEY
+    finnhubApiKey = FINNHUB_API_KEY;  // Fall back to compiled config
+    #endif
+  }
+  // Load Polygon API key - fall back to compiled key if not saved
+  polygonApiKey = prefs.getString("polygonkey", "");
+  if (polygonApiKey.length() == 0) {
+    #ifdef POLYGON_API_KEY
+    polygonApiKey = POLYGON_API_KEY;  // Fall back to compiled config
+    #endif
+  }
   prefs.end();
   
-  Serial.printf("API Key loaded: %s***\n", apiKey.substring(0, 4).c_str());
+  Serial.printf("TwelveData API Key: %s***\n", apiKey.substring(0, 4).c_str());
+  if (finnhubApiKey.length() > 0) {
+    Serial.printf("Finnhub API Key: %s*** (PRIMARY)\n", finnhubApiKey.substring(0, 4).c_str());
+  } else {
+    Serial.println("Finnhub API Key: not configured");
+  }
+  if (polygonApiKey.length() > 0) {
+    Serial.printf("Polygon API Key: %s*** (FALLBACK)\n", polygonApiKey.substring(0, 4).c_str());
+  } else {
+    Serial.println("Polygon API Key: not configured");
+  }
   
   if (lvgl_port_lock(100)) {
     lv_label_set_text(symbolLabel, currentSymbol.c_str());
@@ -2563,16 +3357,26 @@ void loop() {
     }
   }
 
-  // Periodic full-screen invalidate to clear rare stale pixels/artifacts.
-  // Keep it infrequent to avoid tearing and never do it during OTA.
+  // Aggressive full-screen refresh (every 5s) + debug logging
   static uint32_t lastFullInvalidateMs = 0;
-  const uint32_t FULL_INVALIDATE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+  const uint32_t FULL_INVALIDATE_INTERVAL_MS = 5UL * 1000UL;  // 5 seconds - AGGRESSIVE
   if (!otaInProgress && githubOtaTaskHandle == nullptr) {
     uint32_t now = millis();
     if (lastFullInvalidateMs == 0 || (now - lastFullInvalidateMs) >= FULL_INVALIDATE_INTERVAL_MS) {
       if (lvgl_port_lock(20)) {
+        Serial.printf("[REFRESH] Full screen refresh at %lu ms\n", now);
+        if (wifiLogConnected && wifiLogClient.connected()) {
+          wifiLogClient.printf("[REFRESH] %lu ms - FORCING full redraw\n", now);
+        }
+        // Force LVGL to completely redraw entire screen
         lv_obj_invalidate(lv_scr_act());
+        lv_refr_now(NULL);  // Force immediate refresh - don't wait for timer
         lvgl_port_unlock();
+      } else {
+        Serial.println("[REFRESH] Lock failed - skipping");
+        if (wifiLogConnected && wifiLogClient.connected()) {
+          wifiLogClient.println("[REFRESH] Lock failed!");
+        }
       }
       lastFullInvalidateMs = now;
     }
@@ -2580,6 +3384,9 @@ void loop() {
 
   // Weekly scheduled OTA (checks + installs at ~3:00 AM local time)
   autoOtaSchedulerTick();
+  
+  // P2P network heartbeat (share stock data with other devices)
+  p2pTick();
   
   // Process pending actions with proper locking
   if (pendingOpenSettings || pendingClosePopup || pendingOpenWifi || 
@@ -2818,6 +3625,21 @@ void loop() {
     }
   }
   
+  // Nightly reboot at 4AM (market closed) - clears artifacts/memory leaks
+  static uint32_t lastRebootCheckMs = 0;
+  if ((millis() - lastRebootCheckMs) > 60000) {  // Check every minute
+    lastRebootCheckMs = millis();
+    if (timeClient.isTimeSet()) {
+      int hour = timeClient.getHours();
+      int minute = timeClient.getMinutes();
+      if (hour == 4 && minute == 0 && !otaInProgress && githubOtaTaskHandle == nullptr) {
+        Serial.println("[REBOOT] Nightly maintenance reboot at 4:00AM");
+        delay(1000);
+        ESP.restart();
+      }
+    }
+  }
+  
   // Periodic refresh logic
   static uint32_t lastCheck = 0;
   uint32_t now = millis();
@@ -2852,6 +3674,23 @@ void loop() {
   // Handle OTA web server requests
   otaServer.handleClient();
   
+  // Log API stats every 5 minutes
+  if (now - apiStats.lastLogTime > 300000) {
+    apiStats.lastLogTime = now;
+    uint32_t totalCalls = apiStats.twelveDataQuoteCalls + apiStats.twelveDataTimeSeriesCalls;
+    uint32_t totalHits = apiStats.localCacheHits + apiStats.p2pCacheHits;
+    float hitRate = (totalCalls + totalHits > 0) ? 
+                    (float)totalHits / (totalCalls + totalHits) * 100.0f : 0.0f;
+    Serial.println("========== API USAGE STATS ==========");
+    Serial.printf("TwelveData /quote calls:      %u\n", apiStats.twelveDataQuoteCalls);
+    Serial.printf("TwelveData /time_series calls: %u\n", apiStats.twelveDataTimeSeriesCalls);
+    Serial.printf("TOTAL API CALLS:              %u\n", totalCalls);
+    Serial.printf("Local cache hits:             %u\n", apiStats.localCacheHits);
+    Serial.printf("P2P network hits:             %u\n", apiStats.p2pCacheHits);
+    Serial.printf("Cache hit rate:               %.1f%%\n", hitRate);
+    Serial.println("=====================================");
+  }
+  
   // Update clock display every second
   static uint32_t lastClockUpdate = 0;
   if (millis() - lastClockUpdate > 1000) {
@@ -2872,5 +3711,20 @@ void loop() {
     }
   }
 
+  // WiFi debug logging - sends debug messages to PC server
+  static unsigned long lastLogConnect = 0;
+  if (WiFi.status() == WL_CONNECTED && (millis() - lastLogConnect > 30000)) {
+    wifiLogClient.stop();
+    wifiLogConnected = false;
+    if (wifiLogClient.connect(LOG_SERVER_IP, 8888)) {
+      wifiLogConnected = true;
+      Serial.println("[LOG] Connected to WiFi log server");
+      wifiLogClient.println("=== ESP32 Connected ===");
+      wifiLogClient.printf("Firmware: %s\n", FIRMWARE_VERSION);
+      wifiLogClient.printf("Free heap: %u\n", ESP.getFreeHeap());
+    }
+    lastLogConnect = millis();
+  }
+  
   delay(10);
 }
