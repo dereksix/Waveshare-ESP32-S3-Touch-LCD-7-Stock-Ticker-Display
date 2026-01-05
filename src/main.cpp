@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.81"
+#define FIRMWARE_VERSION "1.9.82"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -34,9 +34,47 @@ using namespace esp_panel::board;
 static WiFiClient wifiLogClient;
 static bool wifiLogConnected = false;
 
+// Web-based log buffer (circular buffer for recent logs)
+#define WEB_LOG_LINES 50
+#define WEB_LOG_LINE_LEN 120
+static char webLogBuffer[WEB_LOG_LINES][WEB_LOG_LINE_LEN];
+static int webLogHead = 0;  // Next write position
+static int webLogCount = 0; // Number of valid entries
+
 Preferences prefs;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000);
+
+// Add a log entry to the web log buffer (must be after timeClient declaration)
+void webLog(const char* msg) {
+  // Get timestamp
+  char timestamp[12] = "";
+  if (timeClient.isTimeSet()) {
+    int h = timeClient.getHours();
+    int m = timeClient.getMinutes();
+    int s = timeClient.getSeconds();
+    snprintf(timestamp, sizeof(timestamp), "%02d:%02d:%02d ", h, m, s);
+  }
+  
+  // Copy to buffer with timestamp
+  snprintf(webLogBuffer[webLogHead], WEB_LOG_LINE_LEN, "%s%s", timestamp, msg);
+  webLogHead = (webLogHead + 1) % WEB_LOG_LINES;
+  if (webLogCount < WEB_LOG_LINES) webLogCount++;
+}
+
+// Log to both Serial and web log buffer
+void dualLog(const char* format, ...) {
+  char buf[WEB_LOG_LINE_LEN];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  Serial.print(buf);
+  // Strip trailing newline for web log
+  int len = strlen(buf);
+  if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+  webLog(buf);
+}
 
 // OTA Web Server
 WebServer otaServer(80);
@@ -1075,11 +1113,11 @@ bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
 // Returns true if successful, fills prefetchedStock with data
 bool fetchFromFinnhub(const String& symbol) {
   if (finnhubApiKey.length() == 0) {
-    Serial.println("[FINNHUB] No API key configured");
+    dualLog("[FINNHUB] No API key configured\n");
     return false;
   }
   
-  Serial.printf("[FINNHUB] Fetching quote for %s\n", symbol.c_str());
+  dualLog("[FINNHUB] Fetching %s\n", symbol.c_str());
   HTTPClient http;
   
   // Finnhub quote endpoint
@@ -1089,7 +1127,7 @@ bool fetchFromFinnhub(const String& symbol) {
   int code = http.GET();
   
   if (code != 200) {
-    Serial.printf("[FINNHUB] HTTP error: %d\n", code);
+    dualLog("[FINNHUB] HTTP error: %d\n", code);
     http.end();
     return false;
   }
@@ -1100,7 +1138,7 @@ bool fetchFromFinnhub(const String& symbol) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    Serial.printf("[FINNHUB] JSON parse error: %s\n", err.c_str());
+    dualLog("[FINNHUB] JSON error: %s\n", err.c_str());
     return false;
   }
   
@@ -1109,7 +1147,7 @@ bool fetchFromFinnhub(const String& symbol) {
   float prevClose = doc["pc"] | 0.0f;
   
   if (currentPrice == 0.0f) {
-    Serial.println("[FINNHUB] Invalid response - no price data");
+    dualLog("[FINNHUB] No price data in response\n");
     return false;
   }
   
@@ -1135,19 +1173,18 @@ bool fetchFromFinnhub(const String& symbol) {
   prefetchedStock.oneMonthHigh = 0.0f;
   prefetchedStock.valid = true;
   
-  Serial.printf("[FINNHUB] Success: %s = $%.2f (%.2f%%)\n", 
-                symbol.c_str(), currentPrice, pctChange);
+  dualLog("[FINNHUB] OK: %s $%.2f (%.2f%%)\n", symbol.c_str(), currentPrice, pctChange);
   return true;
 }
 
 // Fetch quote from Polygon.io API (5 calls/min free tier)
 bool fetchFromPolygon(const String& symbol) {
   if (polygonApiKey.length() == 0) {
-    Serial.println("[POLYGON] No API key configured");
+    dualLog("[POLYGON] No API key configured\n");
     return false;
   }
   
-  Serial.printf("[POLYGON] Fetching quote for %s\n", symbol.c_str());
+  dualLog("[POLYGON] Fetching %s\n", symbol.c_str());
   HTTPClient http;
   
   // Polygon previous day endpoint (free tier)
@@ -1157,7 +1194,7 @@ bool fetchFromPolygon(const String& symbol) {
   int code = http.GET();
   
   if (code != 200) {
-    Serial.printf("[POLYGON] HTTP error: %d\n", code);
+    dualLog("[POLYGON] HTTP error: %d\n", code);
     http.end();
     return false;
   }
@@ -1168,14 +1205,14 @@ bool fetchFromPolygon(const String& symbol) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    Serial.printf("[POLYGON] JSON parse error: %s\n", err.c_str());
+    dualLog("[POLYGON] JSON error: %s\n", err.c_str());
     return false;
   }
   
   // Polygon returns: results[0].c=close, h=high, l=low, o=open, v=volume, vw=vwap
   JsonArray results = doc["results"];
   if (results.size() == 0) {
-    Serial.println("[POLYGON] No results returned");
+    dualLog("[POLYGON] No results returned\n");
     return false;
   }
   
@@ -1184,7 +1221,7 @@ bool fetchFromPolygon(const String& symbol) {
   float openPrice = result["o"] | 0.0f;
   
   if (closePrice == 0.0f) {
-    Serial.println("[POLYGON] Invalid response - no price data");
+    dualLog("[POLYGON] No price data in response\n");
     return false;
   }
   
@@ -1210,8 +1247,7 @@ bool fetchFromPolygon(const String& symbol) {
   prefetchedStock.oneMonthHigh = 0.0f;
   prefetchedStock.valid = true;
   
-  Serial.printf("[POLYGON] Success: %s = $%.2f (%.2f%%)\n", 
-                symbol.c_str(), closePrice, pctChange);
+  dualLog("[POLYGON] OK: %s $%.2f (%.2f%%)\n", symbol.c_str(), closePrice, pctChange);
   return true;
 }
 
@@ -1299,27 +1335,24 @@ bool prefetchStockData(const String& symbol) {
     if (p2pFetchStock(symbol, p2pData)) {
       prefetchedStock = p2pData;
       apiStats.p2pCacheHits++;
-      Serial.printf("[P2P] Network hit for %s (total: %u P2P, %u API)\n", 
-                    symbol.c_str(), apiStats.p2pCacheHits, apiStats.twelveDataQuoteCalls);
+      dualLog("[P2P] Hit for %s\n", symbol.c_str());
       return true;
     }
-    Serial.printf("[P2P] No network data for %s - trying Finnhub API\n", symbol.c_str());
+    dualLog("[P2P] Miss for %s - trying APIs\n", symbol.c_str());
   }
   #endif
   
   // Step 3: Try Finnhub API first (primary - 60 calls/min)
   if (finnhubApiKey.length() > 0) {
     if (fetchFromFinnhub(symbol)) {
-      Serial.printf("[FINNHUB] Primary API success for %s\n", symbol.c_str());
       return true;
     }
-    Serial.printf("[FINNHUB] Failed for %s - trying TwelveData fallback\n", symbol.c_str());
+    dualLog("[FINNHUB] Failed - trying TwelveData\n");
   }
   
   // Step 4: Fetch from TwelveData API (fallback)
   apiStats.twelveDataQuoteCalls++;
-  Serial.printf("[API] TwelveData /quote for %s (call #%u today)\n", 
-                symbol.c_str(), apiStats.twelveDataQuoteCalls);
+  dualLog("[12DATA] /quote %s (call #%u)\n", symbol.c_str(), apiStats.twelveDataQuoteCalls);
   HTTPClient http;
   String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + apiKey;
   
@@ -1376,14 +1409,14 @@ bool prefetchStockData(const String& symbol) {
   http.end();
   
   // Step 5: TwelveData also failed - try Polygon as last resort
-  Serial.printf("[API] TwelveData fallback also failed for %s (HTTP %d) - trying Polygon\n", symbol.c_str(), code);
+  dualLog("[12DATA] Failed (HTTP %d) - trying Polygon\n", code);
   
   if (fetchFromPolygon(symbol)) {
     return true;
   }
   
   // All APIs failed - no data available
-  Serial.printf("[API] All APIs failed for %s\n", symbol.c_str());
+  dualLog("[API] All APIs failed for %s\\n", symbol.c_str());
   
   prefetchedStock.valid = false;
   return false;
@@ -2782,6 +2815,18 @@ input[type=submit]:hover{background:#2EA043}
 <form method='POST' action='/update' enctype='multipart/form-data'>
 <input type='file' name='update' accept='.bin' required><br>
 <input type='submit' value='Upload Firmware'></form></div>
+<div class='section'><h2>Live Logs</h2>
+<div id='logs' style='background:#0D1117;border:1px solid #30363D;border-radius:6px;padding:10px;text-align:left;font-family:monospace;font-size:11px;height:300px;overflow-y:auto;white-space:pre-wrap;color:#8B949E'></div>
+<p class='label'>Auto-refreshes every 2 seconds</p>
+</div>
+<script>
+function fetchLogs(){fetch('/logs').then(r=>r.json()).then(d=>{
+var el=document.getElementById('logs');
+el.innerHTML=d.logs.map(l=>'<div>'+l.replace(/</g,'&lt;')+'</div>').join('');
+el.scrollTop=el.scrollHeight;
+}).catch(e=>{});}
+fetchLogs();setInterval(fetchLogs,2000);
+</script>
 </body></html>
 )rawliteral";
   return page;
@@ -2867,6 +2912,30 @@ void setupOTA() {
       }
     }
     otaServer.send(200, "text/html", "<html><body style='background:#0D1117;color:#FF5252;text-align:center;padding:50px'><h1>Invalid Key</h1><p><a href='/' style='color:#58A6FF'>Back</a></p></body></html>");
+  });
+  
+  // Serve logs as JSON for live log viewer
+  otaServer.on("/logs", HTTP_GET, []() {
+    String json = "{\"logs\":[";
+    // Output logs in chronological order (oldest first)
+    int start = (webLogCount < WEB_LOG_LINES) ? 0 : webLogHead;
+    for (int i = 0; i < webLogCount; i++) {
+      int idx = (start + i) % WEB_LOG_LINES;
+      if (i > 0) json += ",";
+      json += "\"";
+      // Escape quotes and backslashes in log messages
+      for (int j = 0; webLogBuffer[idx][j] != '\0' && j < WEB_LOG_LINE_LEN; j++) {
+        char c = webLogBuffer[idx][j];
+        if (c == '"') json += "\\\"";
+        else if (c == '\\') json += "\\\\";
+        else if (c == '\n') json += "\\n";
+        else if (c == '\r') {}  // skip
+        else json += c;
+      }
+      json += "\"";
+    }
+    json += "]}";
+    otaServer.send(200, "application/json", json);
   });
   
   otaServer.on("/update", HTTP_POST, []() {
@@ -3290,6 +3359,11 @@ void setup() {
       Serial.println("WiFi connected!");
       Serial.print("IP Address: ");
       Serial.println(WiFi.localIP());
+      webLog("WiFi connected");
+      
+      char ipBuf[32];
+      snprintf(ipBuf, sizeof(ipBuf), "IP: %s", WiFi.localIP().toString().c_str());
+      webLog(ipBuf);
       
       if (lvgl_port_lock(100)) {
         lv_label_set_text(statusLabel, "Connected");
@@ -3317,11 +3391,13 @@ void setup() {
       // Start OTA web server
       delay(500);
       setupOTA();
+      webLog("Web server ready at stockticker.local");
     } else {
       if (lvgl_port_lock(100)) {
         lv_label_set_text(statusLabel, "WiFi Failed - tap Settings");
         lvgl_port_unlock();
       }
+      webLog("WiFi connection failed");
     }
   } else {
     if (lvgl_port_lock(100)) {
@@ -3331,6 +3407,7 @@ void setup() {
   }
   
   Serial.println("Setup complete!");
+  webLog("Setup complete - v" FIRMWARE_VERSION);
 }
 
 void loop() {
