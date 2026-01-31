@@ -22,6 +22,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install platformio
       
+      - name: Create config.h from example
+        run: |
+          cp include/config.example.h include/config.h
+          # Replace placeholder keys with dummy values for build
+          sed -i 's/YOUR_API_KEY_HERE/BUILD_PLACEHOLDER/' include/config.h
+          sed -i 's/YOUR_FINNHUB_KEY_HERE/BUILD_PLACEHOLDER/' include/config.h
+          sed -i 's/YOUR_POLYGON_KEY_HERE/BUILD_PLACEHOLDER/' include/config.h
+      
       - name: Build firmware
         run: pio run
       
