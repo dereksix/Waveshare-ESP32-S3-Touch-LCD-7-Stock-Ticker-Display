@@ -1058,6 +1058,17 @@ struct OneMonthCache {
 OneMonthCache oneMonthCache[20];
 int oneMonthCacheCount = 0;
 
+// Company name cache (per symbol, 30-day TTL to minimize API calls)
+#define COMPANY_NAME_TTL_DAYS 30
+struct CompanyNameCache {
+  String symbol;
+  String name;
+  uint32_t fetchEpoch;  // Unix epoch when fetched
+  bool valid;
+};
+CompanyNameCache companyNameCache[20];
+int companyNameCacheCount = 0;
+
 // WiFi setup state
 lv_obj_t *wifiPopup = nullptr;
 lv_obj_t *wifiList = nullptr;
@@ -1106,8 +1117,10 @@ void parseRotationList() {
   rotationIndex = 0;
 }
 
-// Forward declaration
+// Forward declarations
 bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
+String fetchCompanyName(const String& symbol);
+void cacheCompanyName(const String& symbol, const String& name);
 
 // Finnhub API fetch - used as fallback when TwelveData fails or rate-limited
 // Returns true if successful, fills prefetchedStock with data
@@ -1345,6 +1358,10 @@ bool prefetchStockData(const String& symbol) {
   // Step 3: Try Finnhub API first (primary - 60 calls/min)
   if (finnhubApiKey.length() > 0) {
     if (fetchFromFinnhub(symbol)) {
+      // Finnhub doesn't return company name - get from cache or fetch
+      if (prefetchedStock.companyName.length() == 0) {
+        prefetchedStock.companyName = fetchCompanyName(symbol);
+      }
       return true;
     }
     dualLog("[FINNHUB] Failed - trying TwelveData\n");
@@ -1385,7 +1402,11 @@ bool prefetchStockData(const String& symbol) {
     if (doc["high"].is<const char*>()) prefetchedStock.highPrice = atof(doc["high"].as<const char*>());
     if (doc["low"].is<const char*>()) prefetchedStock.lowPrice = atof(doc["low"].as<const char*>());
     if (doc["volume"].is<const char*>()) prefetchedStock.volume = atof(doc["volume"].as<const char*>());
-    if (doc["name"].is<const char*>()) prefetchedStock.companyName = doc["name"].as<const char*>();
+    if (doc["name"].is<const char*>()) {
+      prefetchedStock.companyName = doc["name"].as<const char*>();
+      // Cache the company name for 30 days
+      cacheCompanyName(symbol, prefetchedStock.companyName);
+    }
     if (doc["is_market_open"].is<bool>()) prefetchedStock.marketOpen = doc["is_market_open"].as<bool>();
     if (doc["fifty_two_week"]["low"].is<const char*>()) 
       prefetchedStock.fiftyTwoLow = atof(doc["fifty_two_week"]["low"].as<const char*>());
@@ -1412,6 +1433,10 @@ bool prefetchStockData(const String& symbol) {
   dualLog("[12DATA] Failed (HTTP %d) - trying Polygon\n", code);
   
   if (fetchFromPolygon(symbol)) {
+    // Polygon doesn't return company name - get from cache
+    if (prefetchedStock.companyName.length() == 0) {
+      prefetchedStock.companyName = fetchCompanyName(symbol);
+    }
     return true;
   }
   
@@ -1453,6 +1478,88 @@ void cacheOneMonthData(const String& symbol, float low, float high, int day) {
     oneMonthCache[oneMonthCacheCount].valid = true;
     oneMonthCacheCount++;
   }
+}
+
+// Find cached company name for a symbol
+String findCachedCompanyName(const String& symbol) {
+  uint32_t now = timeClient.getEpochTime();
+  uint32_t maxAge = COMPANY_NAME_TTL_DAYS * 24 * 60 * 60;  // 30 days in seconds
+  
+  for (int i = 0; i < companyNameCacheCount; i++) {
+    if (companyNameCache[i].valid && companyNameCache[i].symbol == symbol) {
+      // Check if still valid (within TTL)
+      if (now - companyNameCache[i].fetchEpoch < maxAge) {
+        return companyNameCache[i].name;
+      }
+      // Expired - mark invalid
+      companyNameCache[i].valid = false;
+      return "";
+    }
+  }
+  return "";
+}
+
+// Cache a company name with current timestamp
+void cacheCompanyName(const String& symbol, const String& name) {
+  if (name.length() == 0) return;
+  
+  uint32_t now = timeClient.getEpochTime();
+  
+  // Check if symbol already exists
+  for (int i = 0; i < companyNameCacheCount; i++) {
+    if (companyNameCache[i].symbol == symbol) {
+      companyNameCache[i].name = name;
+      companyNameCache[i].fetchEpoch = now;
+      companyNameCache[i].valid = true;
+      return;
+    }
+  }
+  // Add new entry if space available
+  if (companyNameCacheCount < 20) {
+    companyNameCache[companyNameCacheCount].symbol = symbol;
+    companyNameCache[companyNameCacheCount].name = name;
+    companyNameCache[companyNameCacheCount].fetchEpoch = now;
+    companyNameCache[companyNameCacheCount].valid = true;
+    companyNameCacheCount++;
+  }
+}
+
+// Fetch company name from TwelveData (uses /quote endpoint, cached for 30 days)
+String fetchCompanyName(const String& symbol) {
+  // Check cache first
+  String cached = findCachedCompanyName(symbol);
+  if (cached.length() > 0) {
+    dualLog("[COMPANY] Cache hit: %s = %s\n", symbol.c_str(), cached.c_str());
+    return cached;
+  }
+  
+  if (apiKey.length() == 0) return "";
+  
+  dualLog("[COMPANY] Fetching name for %s\n", symbol.c_str());
+  HTTPClient http;
+  String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + apiKey;
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    
+    if (doc["name"].is<const char*>()) {
+      String name = doc["name"].as<String>();
+      if (name.length() > 0) {
+        cacheCompanyName(symbol, name);
+        dualLog("[COMPANY] Cached: %s = %s (30d TTL)\n", symbol.c_str(), name.c_str());
+        http.end();
+        return name;
+      }
+    }
+  }
+  
+  http.end();
+  return "";
 }
 
 // Fetch 1-month high/low from time_series API (once per day per symbol)
