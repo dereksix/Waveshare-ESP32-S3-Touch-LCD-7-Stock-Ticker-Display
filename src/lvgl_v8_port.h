@@ -74,9 +74,9 @@
 #define LVGL_PORT_AVOID_TEARING_MODE            (CONFIG_LVGL_PORT_AVOID_TEARING_MODE)
                                                         // Valid if using ESP-IDF
 #else
-#define LVGL_PORT_AVOID_TEARING_MODE            (0)     // Valid if using Arduino
+#define LVGL_PORT_AVOID_TEARING_MODE            (1)     // Valid if using Arduino
                                                         // Mode 0: NO anti-tear (simplest, uses drawBitmap)
-                                                        // Mode 1: double-buffer + full-refresh
+                                                        // Mode 1: double-buffer + full-refresh (fixes left-side tearing)
                                                         // Mode 2: triple-buffer + full-refresh (broke display!)
                                                         // Mode 3: double-buffer + direct-mode (causes clipping issues)
 #endif
