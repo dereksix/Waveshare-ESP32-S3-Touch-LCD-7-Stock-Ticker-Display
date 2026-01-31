@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.85"
+#define FIRMWARE_VERSION "1.9.86"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -1069,6 +1069,18 @@ struct CompanyNameCache {
 CompanyNameCache companyNameCache[20];
 int companyNameCacheCount = 0;
 
+// 52-week range cache (per symbol, 7-day TTL - changes slowly)
+#define FIFTY_TWO_WEEK_TTL_DAYS 7
+struct FiftyTwoWeekCache {
+  String symbol;
+  float low;
+  float high;
+  uint32_t fetchEpoch;
+  bool valid;
+};
+FiftyTwoWeekCache fiftyTwoWeekCache[20];
+int fiftyTwoWeekCacheCount = 0;
+
 // WiFi setup state
 lv_obj_t *wifiPopup = nullptr;
 lv_obj_t *wifiList = nullptr;
@@ -1119,6 +1131,7 @@ void parseRotationList() {
 
 // Forward declarations
 bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
+bool fetch52WeekRange(const String& symbol, float& outLow, float& outHigh);
 String fetchCompanyName(const String& symbol);
 void cacheCompanyName(const String& symbol, const String& name);
 
@@ -1362,6 +1375,13 @@ bool prefetchStockData(const String& symbol) {
       if (prefetchedStock.companyName.length() == 0) {
         prefetchedStock.companyName = fetchCompanyName(symbol);
       }
+      // Finnhub doesn't return 52-week or 1-month data - fetch from TwelveData with caching
+      if (prefetchedStock.fiftyTwoLow == 0.0f || prefetchedStock.fiftyTwoHigh == 0.0f) {
+        fetch52WeekRange(symbol, prefetchedStock.fiftyTwoLow, prefetchedStock.fiftyTwoHigh);
+      }
+      if (prefetchedStock.oneMonthLow == 0.0f || prefetchedStock.oneMonthHigh == 0.0f) {
+        fetchOneMonthRange(symbol, prefetchedStock.oneMonthLow, prefetchedStock.oneMonthHigh);
+      }
       return true;
     }
     dualLog("[FINNHUB] Failed - trying TwelveData\n");
@@ -1560,6 +1580,92 @@ String fetchCompanyName(const String& symbol) {
   
   http.end();
   return "";
+}
+
+// Check if we have valid 52-week data in cache (7-day TTL)
+FiftyTwoWeekCache* findCachedFiftyTwoWeek(const String& symbol) {
+  uint32_t now = timeClient.getEpochTime();
+  const uint32_t TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+  
+  for (int i = 0; i < fiftyTwoWeekCacheCount; i++) {
+    if (fiftyTwoWeekCache[i].valid && fiftyTwoWeekCache[i].symbol == symbol) {
+      if ((now - fiftyTwoWeekCache[i].fetchEpoch) < TTL_SECONDS) {
+        return &fiftyTwoWeekCache[i];
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Cache 52-week data with current timestamp
+void cacheFiftyTwoWeek(const String& symbol, float low, float high) {
+  if (low <= 0 || high <= 0) return;
+  
+  uint32_t now = timeClient.getEpochTime();
+  
+  // Check if symbol already exists
+  for (int i = 0; i < fiftyTwoWeekCacheCount; i++) {
+    if (fiftyTwoWeekCache[i].symbol == symbol) {
+      fiftyTwoWeekCache[i].low = low;
+      fiftyTwoWeekCache[i].high = high;
+      fiftyTwoWeekCache[i].fetchEpoch = now;
+      fiftyTwoWeekCache[i].valid = true;
+      return;
+    }
+  }
+  // Add new entry if space available
+  if (fiftyTwoWeekCacheCount < 20) {
+    fiftyTwoWeekCache[fiftyTwoWeekCacheCount].symbol = symbol;
+    fiftyTwoWeekCache[fiftyTwoWeekCacheCount].low = low;
+    fiftyTwoWeekCache[fiftyTwoWeekCacheCount].high = high;
+    fiftyTwoWeekCache[fiftyTwoWeekCacheCount].fetchEpoch = now;
+    fiftyTwoWeekCache[fiftyTwoWeekCacheCount].valid = true;
+    fiftyTwoWeekCacheCount++;
+  }
+}
+
+// Fetch 52-week range from TwelveData (uses /quote endpoint, cached for 7 days)
+bool fetch52WeekRange(const String& symbol, float& outLow, float& outHigh) {
+  // Check cache first
+  FiftyTwoWeekCache* cached = findCachedFiftyTwoWeek(symbol);
+  if (cached != nullptr) {
+    outLow = cached->low;
+    outHigh = cached->high;
+    dualLog("[52W] Cache hit: %s = %.2f - %.2f\n", symbol.c_str(), outLow, outHigh);
+    return true;
+  }
+  
+  if (apiKey.length() == 0) return false;
+  
+  dualLog("[52W] Fetching 52-week range for %s\n", symbol.c_str());
+  HTTPClient http;
+  String url = "https://api.twelvedata.com/quote?symbol=" + symbol + "&apikey=" + apiKey;
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    
+    if (doc["fifty_two_week"].is<JsonObject>()) {
+      JsonObject w = doc["fifty_two_week"];
+      float low = w["low"].as<float>();
+      float high = w["high"].as<float>();
+      if (low > 0 && high > 0) {
+        cacheFiftyTwoWeek(symbol, low, high);
+        outLow = low;
+        outHigh = high;
+        dualLog("[52W] Cached: %s = %.2f - %.2f (7d TTL)\n", symbol.c_str(), low, high);
+        http.end();
+        return true;
+      }
+    }
+  }
+  
+  http.end();
+  return false;
 }
 
 // Fetch 1-month high/low from time_series API (once per day per symbol)
