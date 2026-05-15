@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.4"
+#define FIRMWARE_VERSION "1.10.5"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -736,6 +736,9 @@ struct SparkHistory {
 };
 SparkHistory sparkHist[20];
 int sparkHistCount = 0;
+uint32_t lastSparkSaveMs = 0;
+bool sparkDirty = false;
+#define SPARK_SAVE_INTERVAL_MS (5UL * 60UL * 1000UL)  // every 5 minutes
 
 // Clock display
 lv_obj_t *clockLabel = nullptr;
@@ -1106,6 +1109,7 @@ void appendSparkPoint(const String& symbol, float price) {
       sparkHist[i].pts[sparkHist[i].head] = price;
       sparkHist[i].head = (sparkHist[i].head + 1) % SPARK_POINTS;
       if (sparkHist[i].count < SPARK_POINTS) sparkHist[i].count++;
+      sparkDirty = true;
       return;
     }
   }
@@ -1116,7 +1120,59 @@ void appendSparkPoint(const String& symbol, float price) {
     sparkHist[sparkHistCount].head = 1;
     sparkHist[sparkHistCount].count = 1;
     sparkHistCount++;
+    sparkDirty = true;
   }
+}
+
+// ===== Persistence: pack as a single binary blob =====
+// Per entry: 12-byte symbol + 1-byte count + 1-byte head + 2-byte pad + 30 floats = 136 bytes
+#pragma pack(push, 1)
+struct SparkPersistEntry {
+  char sym[12];
+  uint8_t count;
+  uint8_t head;
+  uint16_t _pad;
+  float pts[SPARK_POINTS];
+};
+#pragma pack(pop)
+
+void saveSparkHistory() {
+  if (sparkHistCount == 0) return;
+  SparkPersistEntry buf[20] = {};
+  int n = sparkHistCount; if (n > 20) n = 20;
+  for (int i = 0; i < n; i++) {
+    strncpy(buf[i].sym, sparkHist[i].symbol.c_str(), sizeof(buf[i].sym) - 1);
+    buf[i].count = (uint8_t)(sparkHist[i].count > 255 ? 255 : sparkHist[i].count);
+    buf[i].head  = (uint8_t)(sparkHist[i].head & 0xFF);
+    memcpy(buf[i].pts, sparkHist[i].pts, sizeof(buf[i].pts));
+  }
+  prefs.begin("stock", false);
+  prefs.putUChar("sparkN", (uint8_t)n);
+  prefs.putBytes("sparks", buf, n * sizeof(SparkPersistEntry));
+  prefs.end();
+  sparkDirty = false;
+  Serial.printf("[SPARK] Saved %d symbols (%d bytes)\n", n, n * (int)sizeof(SparkPersistEntry));
+}
+
+void loadSparkHistory() {
+  prefs.begin("stock", true);
+  uint8_t n = prefs.getUChar("sparkN", 0);
+  if (n == 0 || n > 20) { prefs.end(); return; }
+  SparkPersistEntry buf[20] = {};
+  size_t got = prefs.getBytes("sparks", buf, n * sizeof(SparkPersistEntry));
+  prefs.end();
+  if (got != n * sizeof(SparkPersistEntry)) {
+    Serial.printf("[SPARK] Load size mismatch (got %u, want %u)\n", (unsigned)got, (unsigned)(n * sizeof(SparkPersistEntry)));
+    return;
+  }
+  sparkHistCount = n;
+  for (int i = 0; i < n; i++) {
+    sparkHist[i].symbol = String(buf[i].sym);
+    sparkHist[i].count = buf[i].count;
+    sparkHist[i].head  = buf[i].head;
+    memcpy(sparkHist[i].pts, buf[i].pts, sizeof(sparkHist[i].pts));
+  }
+  Serial.printf("[SPARK] Loaded %d symbols\n", n);
 }
 
 // Get ordered (oldest..newest) spark points for a symbol; returns count written
@@ -4276,6 +4332,9 @@ void setup() {
       parseRotationList();
       lastRotationTime = millis();
       
+      // Restore sparkline history from prior session
+      loadSparkHistory();
+      
       // If rotation enabled, start with first symbol
       if (rotationEnabled && rotationCount > 0) {
         currentSymbol = rotationSymbols[0];
@@ -4360,6 +4419,12 @@ void loop() {
 
   // Weekly scheduled OTA (checks + installs at ~3:00 AM local time)
   autoOtaSchedulerTick();
+  
+  // Periodic sparkline persistence (every 5 minutes, only if dirty)
+  if (sparkDirty && (millis() - lastSparkSaveMs) > SPARK_SAVE_INTERVAL_MS) {
+    lastSparkSaveMs = millis();
+    saveSparkHistory();
+  }
   
   // P2P network heartbeat (share stock data with other devices)
   p2pTick();
