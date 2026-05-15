@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.9.89"
+#define FIRMWARE_VERSION "1.10.0"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -44,6 +44,59 @@ static int webLogCount = 0; // Number of valid entries
 Preferences prefs;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000);
+
+// ===== US Eastern timezone with automatic DST =====
+// EST = UTC-5 (-18000s), EDT = UTC-4 (-14400s)
+// DST: 2nd Sunday of March 2am EST -> 1st Sunday of November 2am EDT
+static int currentTzOffsetSec = -18000;
+
+// Zeller's congruence: returns 0=Sat,1=Sun,2=Mon,...,6=Fri for date y-m-d
+static int zellerWeekday(int y, int m, int d) {
+  if (m < 3) { m += 12; y -= 1; }
+  int K = y % 100;
+  int J = y / 100;
+  return (d + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+}
+
+// Day-of-month for the Nth Sunday of given month/year (n=1..5)
+static int nthSundayOfMonth(int y, int m, int n) {
+  int h1 = zellerWeekday(y, m, 1);              // weekday of day 1
+  int firstSundayDay = 1 + ((1 - h1 + 7) % 7);  // 1=Sunday in Zeller scheme
+  return firstSundayDay + (n - 1) * 7;
+}
+
+// Is the given UTC instant inside US Eastern DST?
+static bool inUsDst(int year, int month, int dayUtc, int hourUtc) {
+  if (month < 3 || month > 11) return false;
+  if (month > 3 && month < 11) return true;
+  if (month == 3) {
+    int dstStart = nthSundayOfMonth(year, 3, 2);
+    if (dayUtc > dstStart) return true;
+    if (dayUtc < dstStart) return false;
+    return hourUtc >= 7;   // 2am EST = 07:00 UTC
+  }
+  // November
+  int dstEnd = nthSundayOfMonth(year, 11, 1);
+  if (dayUtc < dstEnd) return true;
+  if (dayUtc > dstEnd) return false;
+  return hourUtc < 6;      // 2am EDT = 06:00 UTC
+}
+
+// Recompute and apply the correct US-ET offset to timeClient.
+// Safe to call frequently; only writes when offset actually changes.
+void applyUsEasternOffset() {
+  uint32_t localEpoch = timeClient.getEpochTime();
+  if (localEpoch < 1000000000UL) return;  // time not yet set
+  time_t utc = (time_t)((int64_t)localEpoch - (int64_t)currentTzOffsetSec);
+  struct tm t;
+  gmtime_r(&utc, &t);
+  int newOffset = inUsDst(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour) ? -14400 : -18000;
+  if (newOffset != currentTzOffsetSec) {
+    timeClient.setTimeOffset(newOffset);
+    currentTzOffsetSec = newOffset;
+    Serial.printf("[TZ] %s applied (offset=%d)\n", newOffset == -14400 ? "EDT" : "EST", newOffset);
+  }
+}
 
 // Add a log entry to the web log buffer (must be after timeClient declaration)
 void webLog(const char* msg) {
@@ -647,6 +700,36 @@ lv_obj_t *rotationPopup = nullptr;
 lv_obj_t *rotationIntervalDropdown = nullptr;
 bool pendingRotation = false;
 
+// ===== Dashboard (grid view) state =====
+bool dashboardMode = false;
+lv_obj_t *dashboardScreen = nullptr;        // Full-screen overlay container
+lv_obj_t *dashboardHeaderLbl = nullptr;     // Header status label
+lv_obj_t *dashboardClockLbl = nullptr;      // Header clock
+lv_obj_t *dashboardTiles[20] = {nullptr};
+lv_obj_t *dashboardTileSym[20] = {nullptr};
+lv_obj_t *dashboardTilePrice[20] = {nullptr};
+lv_obj_t *dashboardTilePct[20] = {nullptr};
+lv_obj_t *dashboardTileChart[20] = {nullptr};
+lv_chart_series_t *dashboardTileSeries[20] = {nullptr};
+int dashboardTileCount = 0;
+String dashboardTileSymbols[20];
+uint32_t lastDashboardUpdate = 0;
+uint32_t lastDashboardFetch = 0;
+int dashboardFetchIdx = 0;
+bool pendingEnterDashboard = false;
+bool pendingExitDashboard = false;
+
+// Rolling sparkline history per symbol (mirrors symbolCache indices)
+#define SPARK_POINTS 30
+struct SparkHistory {
+  String symbol;
+  float pts[SPARK_POINTS];
+  int count;
+  int head;       // index of next write
+};
+SparkHistory sparkHist[20];
+int sparkHistCount = 0;
+
 // Clock display
 lv_obj_t *clockLabel = nullptr;
 
@@ -1002,6 +1085,47 @@ void cacheSymbolData(const CachedStockData& data) {
   if (symbolCacheCount < 20) {
     symbolCache[symbolCacheCount++] = data;
   }
+}
+
+// Append a price point to the rolling sparkline history for a symbol
+void appendSparkPoint(const String& symbol, float price) {
+  if (price <= 0.0f) return;
+  // Find existing
+  for (int i = 0; i < sparkHistCount; i++) {
+    if (sparkHist[i].symbol == symbol) {
+      // Avoid duplicate consecutive points (same price within a refresh cycle)
+      int lastIdx = (sparkHist[i].head - 1 + SPARK_POINTS) % SPARK_POINTS;
+      if (sparkHist[i].count > 0 && sparkHist[i].pts[lastIdx] == price) return;
+      sparkHist[i].pts[sparkHist[i].head] = price;
+      sparkHist[i].head = (sparkHist[i].head + 1) % SPARK_POINTS;
+      if (sparkHist[i].count < SPARK_POINTS) sparkHist[i].count++;
+      return;
+    }
+  }
+  // New entry
+  if (sparkHistCount < 20) {
+    sparkHist[sparkHistCount].symbol = symbol;
+    sparkHist[sparkHistCount].pts[0] = price;
+    sparkHist[sparkHistCount].head = 1;
+    sparkHist[sparkHistCount].count = 1;
+    sparkHistCount++;
+  }
+}
+
+// Get ordered (oldest..newest) spark points for a symbol; returns count written
+int getSparkPoints(const String& symbol, float* out, int maxOut) {
+  for (int i = 0; i < sparkHistCount; i++) {
+    if (sparkHist[i].symbol == symbol) {
+      int n = sparkHist[i].count;
+      if (n > maxOut) n = maxOut;
+      int start = (sparkHist[i].head - sparkHist[i].count + SPARK_POINTS) % SPARK_POINTS;
+      for (int j = 0; j < n; j++) {
+        out[j] = sparkHist[i].pts[(start + j) % SPARK_POINTS];
+      }
+      return n;
+    }
+  }
+  return 0;
 }
 
 // Last time we checked if market reopened (when closed)
@@ -1874,6 +1998,7 @@ void applyPrefetchedData() {
   newCache.marketOpen = prefetchedStock.marketOpen;
   newCache.fetchTime = millis();
   cacheSymbolData(newCache);
+  appendSparkPoint(currentSymbol, prefetchedStock.closePrice);
   
   prefetchedStock.valid = false;  // Mark as consumed
 }
@@ -2167,6 +2292,7 @@ void fetchPrice() {
     
     // Also add to multi-symbol cache for rotation
     cacheSymbolData(cachedData);
+    appendSparkPoint(currentSymbol, closePrice);
     
     prefs.begin("stock", false);
     prefs.putString("symbol", currentSymbol);
@@ -2538,6 +2664,297 @@ void doWifiConnect() {
   }
 }
 
+// ============================================================================
+// DASHBOARD (GRID) VIEW
+// ============================================================================
+
+static void computeDashGrid(int n, int& cols, int& rows) {
+  if (n <= 1)      { cols = 1; rows = 1; }
+  else if (n == 2) { cols = 2; rows = 1; }
+  else if (n <= 4) { cols = 2; rows = 2; }
+  else if (n <= 6) { cols = 3; rows = 2; }
+  else if (n <= 9) { cols = 3; rows = 3; }
+  else if (n <= 12){ cols = 4; rows = 3; }
+  else if (n <= 16){ cols = 4; rows = 4; }
+  else             { cols = 5; rows = 4; }
+}
+
+// Tile click: select this symbol, exit dashboard, fetch
+static void dashboardTile_cb(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= dashboardTileCount) return;
+  String sym = dashboardTileSymbols[idx];
+  if (sym.length() == 0) return;
+  // Disable rotation, switch to single view on this symbol
+  rotationEnabled = false;
+  prefs.begin("stock", false);
+  prefs.putBool("rotate_on", false);
+  prefs.end();
+  currentSymbol = sym;
+  pendingExitDashboard = true;
+  pendingFetch = true;
+}
+
+// Format a price compactly for tile display
+static void formatTilePrice(float price, char* out, size_t n) {
+  if (price >= 1000.0f)      snprintf(out, n, "$%.0f", price);
+  else if (price >= 100.0f)  snprintf(out, n, "$%.2f", price);
+  else                       snprintf(out, n, "$%.2f", price);
+}
+
+// Update one tile's labels + sparkline from cached data
+static void updateOneTile(int idx) {
+  if (!dashboardTiles[idx]) return;
+  String sym = dashboardTileSymbols[idx];
+  CachedStockData* c = findCachedSymbol(sym);
+
+  if (!c || !c->valid) {
+    lv_label_set_text(dashboardTilePrice[idx], "--");
+    lv_label_set_text(dashboardTilePct[idx], "...");
+    lv_obj_set_style_text_color(dashboardTilePct[idx], lv_color_hex(0x8B949E), 0);
+    return;
+  }
+
+  // Parse price
+  String ps = c->priceStr; ps.replace("$", ""); ps.replace(",", "");
+  float price = ps.toFloat();
+  char priceBuf[24];
+  formatTilePrice(price, priceBuf, sizeof(priceBuf));
+  lv_label_set_text(dashboardTilePrice[idx], priceBuf);
+
+  // Parse % change
+  String pct = c->changeStr; pct.replace("%", ""); pct.replace("+", "");
+  float pctVal = pct.toFloat();
+  char pctBuf[24];
+  const char* arrow = pctVal >= 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN;
+  snprintf(pctBuf, sizeof(pctBuf), "%s %+.2f%%", arrow, pctVal);
+  lv_label_set_text(dashboardTilePct[idx], pctBuf);
+
+  lv_color_t col = pctVal >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252);
+  lv_obj_set_style_text_color(dashboardTilePct[idx], col, 0);
+  lv_obj_set_style_border_color(dashboardTiles[idx], col, 0);
+
+  // Sparkline
+  lv_obj_t *chart = dashboardTileChart[idx];
+  lv_chart_series_t *ser = dashboardTileSeries[idx];
+  if (chart && ser) {
+    float pts[SPARK_POINTS];
+    int n = getSparkPoints(sym, pts, SPARK_POINTS);
+    lv_chart_set_point_count(chart, n > 1 ? n : 2);
+    if (n >= 2) {
+      float minV = pts[0], maxV = pts[0];
+      for (int i = 1; i < n; i++) {
+        if (pts[i] < minV) minV = pts[i];
+        if (pts[i] > maxV) maxV = pts[i];
+      }
+      if (maxV - minV < 0.01f) { maxV = minV + 1.0f; }
+      lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
+      for (int i = 0; i < n; i++) {
+        int v = (int)((pts[i] - minV) / (maxV - minV) * 1000.0f);
+        lv_chart_set_value_by_id(chart, ser, i, v);
+      }
+      lv_obj_set_style_line_color(chart, col, LV_PART_ITEMS);
+      lv_obj_clear_flag(chart, LV_OBJ_FLAG_HIDDEN);
+      lv_chart_refresh(chart);
+    } else {
+      // Not enough data yet
+      lv_obj_add_flag(chart, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+void updateDashboardTiles() {
+  if (!dashboardScreen) return;
+  for (int i = 0; i < dashboardTileCount; i++) {
+    updateOneTile(i);
+  }
+  // Header clock
+  if (dashboardClockLbl && timeClient.isTimeSet()) {
+    int h = timeClient.getHours();
+    int m = timeClient.getMinutes();
+    int h12 = h % 12; if (h12 == 0) h12 = 12;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d:%02d %s", h12, m, h >= 12 ? "PM" : "AM");
+    lv_label_set_text(dashboardClockLbl, buf);
+  }
+  // Header status
+  if (dashboardHeaderLbl) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Watchlist  (%s)", isMarketOpen ? "Market Open" : "Market Closed");
+    lv_label_set_text(dashboardHeaderLbl, buf);
+  }
+}
+
+void destroyDashboardUI() {
+  if (!dashboardScreen) return;
+  lv_obj_del(dashboardScreen);
+  dashboardScreen = nullptr;
+  dashboardHeaderLbl = nullptr;
+  dashboardClockLbl = nullptr;
+  for (int i = 0; i < 20; i++) {
+    dashboardTiles[i] = nullptr;
+    dashboardTileSym[i] = nullptr;
+    dashboardTilePrice[i] = nullptr;
+    dashboardTilePct[i] = nullptr;
+    dashboardTileChart[i] = nullptr;
+    dashboardTileSeries[i] = nullptr;
+    dashboardTileSymbols[i] = "";
+  }
+  dashboardTileCount = 0;
+  lv_obj_invalidate(lv_scr_act());
+}
+
+void createDashboardUI() {
+  if (dashboardScreen) return;
+
+  // Build the list of symbols to display
+  String syms[20];
+  int n = 0;
+  if (rotationCount > 0) {
+    for (int i = 0; i < rotationCount && n < 20; i++) syms[n++] = rotationSymbols[i];
+  } else {
+    for (int i = 0; i < numTickers && n < 20; i++) syms[n++] = String(tickers[i]);
+  }
+  if (n == 0) { syms[n++] = currentSymbol; }
+  dashboardTileCount = n;
+  for (int i = 0; i < n; i++) dashboardTileSymbols[i] = syms[i];
+
+  // Full-screen overlay container
+  dashboardScreen = lv_obj_create(lv_scr_act());
+  lv_obj_remove_style_all(dashboardScreen);
+  lv_obj_set_size(dashboardScreen, 800, 480);
+  lv_obj_set_pos(dashboardScreen, 0, 0);
+  lv_obj_set_style_bg_color(dashboardScreen, lv_color_hex(0x0D1117), 0);
+  lv_obj_set_style_bg_opa(dashboardScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(dashboardScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Header (50px)
+  dashboardClockLbl = lv_label_create(dashboardScreen);
+  lv_label_set_text(dashboardClockLbl, "--:-- --");
+  lv_obj_set_style_text_font(dashboardClockLbl, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(dashboardClockLbl, lv_color_hex(0x8B949E), 0);
+  lv_obj_align(dashboardClockLbl, LV_ALIGN_TOP_LEFT, 12, 14);
+
+  dashboardHeaderLbl = lv_label_create(dashboardScreen);
+  lv_label_set_text(dashboardHeaderLbl, "Watchlist");
+  lv_obj_set_style_text_font(dashboardHeaderLbl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(dashboardHeaderLbl, lv_color_hex(0xC9D1D9), 0);
+  lv_obj_align(dashboardHeaderLbl, LV_ALIGN_TOP_MID, 0, 12);
+
+  // Settings button (top-right) on dashboard
+  lv_obj_t *settingsBtn = lv_btn_create(dashboardScreen);
+  lv_obj_set_size(settingsBtn, 80, 36);
+  lv_obj_align(settingsBtn, LV_ALIGN_TOP_RIGHT, -10, 7);
+  lv_obj_set_style_bg_color(settingsBtn, lv_color_hex(0x21262D), 0);
+  lv_obj_set_style_border_color(settingsBtn, lv_color_hex(0x30363D), 0);
+  lv_obj_set_style_border_width(settingsBtn, 1, 0);
+  lv_obj_set_style_radius(settingsBtn, 8, 0);
+  lv_obj_t *settingsLbl = lv_label_create(settingsBtn);
+  lv_label_set_text(settingsLbl, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_font(settingsLbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(settingsLbl, lv_color_hex(0xC9D1D9), 0);
+  lv_obj_center(settingsLbl);
+  lv_obj_add_event_cb(settingsBtn, open_settings_cb, LV_EVENT_CLICKED, NULL);
+
+  // Subtle divider line
+  lv_obj_t *div = lv_obj_create(dashboardScreen);
+  lv_obj_remove_style_all(div);
+  lv_obj_set_size(div, 780, 1);
+  lv_obj_set_pos(div, 10, 50);
+  lv_obj_set_style_bg_color(div, lv_color_hex(0x30363D), 0);
+  lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+
+  // Grid layout
+  int cols, rows;
+  computeDashGrid(n, cols, rows);
+  const int gridX = 8, gridY = 56, gridW = 800 - 16, gridH = 480 - 56 - 8;
+  const int gap = 6;
+  int tileW = (gridW - (cols - 1) * gap) / cols;
+  int tileH = (gridH - (rows - 1) * gap) / rows;
+
+  // Decide font sizes based on tile size
+  const lv_font_t* symFont = &lv_font_montserrat_24;
+  const lv_font_t* priceFont = &lv_font_montserrat_26;
+  const lv_font_t* pctFont = &lv_font_montserrat_16;
+  if (tileH < 130) {
+    symFont = &lv_font_montserrat_18;
+    priceFont = &lv_font_montserrat_20;
+    pctFont = &lv_font_montserrat_14;
+  }
+  if (tileH < 100) {
+    symFont = &lv_font_montserrat_16;
+    priceFont = &lv_font_montserrat_18;
+    pctFont = &lv_font_montserrat_12;
+  }
+  int sparkH = tileH / 3;
+  if (sparkH < 24) sparkH = 24;
+  if (sparkH > 60) sparkH = 60;
+
+  for (int i = 0; i < n; i++) {
+    int r = i / cols;
+    int c = i % cols;
+    int x = gridX + c * (tileW + gap);
+    int y = gridY + r * (tileH + gap);
+
+    lv_obj_t *tile = lv_obj_create(dashboardScreen);
+    lv_obj_set_pos(tile, x, y);
+    lv_obj_set_size(tile, tileW, tileH);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(0x161B22), 0);
+    lv_obj_set_style_border_color(tile, lv_color_hex(0x30363D), 0);
+    lv_obj_set_style_border_width(tile, 2, 0);
+    lv_obj_set_style_radius(tile, 10, 0);
+    lv_obj_set_style_pad_all(tile, 6, 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(tile, dashboardTile_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    dashboardTiles[i] = tile;
+
+    // Symbol (top-left)
+    lv_obj_t *sym = lv_label_create(tile);
+    lv_label_set_text(sym, syms[i].c_str());
+    lv_obj_set_style_text_font(sym, symFont, 0);
+    lv_obj_set_style_text_color(sym, lv_color_hex(0x58A6FF), 0);
+    lv_obj_align(sym, LV_ALIGN_TOP_LEFT, 0, 0);
+    dashboardTileSym[i] = sym;
+
+    // % change (top-right)
+    lv_obj_t *pct = lv_label_create(tile);
+    lv_label_set_text(pct, "...");
+    lv_obj_set_style_text_font(pct, pctFont, 0);
+    lv_obj_set_style_text_color(pct, lv_color_hex(0x8B949E), 0);
+    lv_obj_align(pct, LV_ALIGN_TOP_RIGHT, 0, 2);
+    dashboardTilePct[i] = pct;
+
+    // Price (middle/left)
+    lv_obj_t *price = lv_label_create(tile);
+    lv_label_set_text(price, "--");
+    lv_obj_set_style_text_font(price, priceFont, 0);
+    lv_obj_set_style_text_color(price, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(price, LV_ALIGN_LEFT_MID, 0, -sparkH / 4);
+    dashboardTilePrice[i] = price;
+
+    // Sparkline chart (bottom)
+    lv_obj_t *chart = lv_chart_create(tile);
+    lv_obj_set_size(chart, tileW - 16, sparkH);
+    lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_div_line_count(chart, 0, 0);
+    lv_chart_set_point_count(chart, SPARK_POINTS);
+    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(chart, 0, 0);
+    lv_obj_set_style_pad_all(chart, 0, 0);
+    lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
+    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+    lv_chart_series_t *ser = lv_chart_add_series(chart, lv_color_hex(0x00E676), LV_CHART_AXIS_PRIMARY_Y);
+    dashboardTileChart[i] = chart;
+    dashboardTileSeries[i] = ser;
+  }
+
+  // Initial paint from cache
+  updateDashboardTiles();
+}
+
 void createSettingsPopup() {
   if (settingsPopup != nullptr || wifiPopup != nullptr) return;
   
@@ -2612,6 +3029,25 @@ void createSettingsPopup() {
   lv_obj_set_style_text_font(goLbl, &lv_font_montserrat_18, 0);
   lv_obj_center(goLbl);
   lv_obj_add_event_cb(goBtn, custom_symbol_go_cb, LV_EVENT_CLICKED, NULL);
+  
+  // ===== Dashboard (grid) View Toggle =====
+  lv_obj_t *dashBtn = lv_btn_create(settingsPopup);
+  lv_obj_set_size(dashBtn, 180, 50);
+  lv_obj_set_pos(dashBtn, 480, 205);
+  lv_obj_set_style_bg_color(dashBtn, dashboardMode ? lv_color_hex(0x00AA00) : lv_color_hex(0x444444), 0);
+  lv_obj_t *dashBtnLbl = lv_label_create(dashBtn);
+  lv_label_set_text(dashBtnLbl, dashboardMode ? (LV_SYMBOL_LIST " Single View") : (LV_SYMBOL_LIST " Dashboard"));
+  lv_obj_set_style_text_font(dashBtnLbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(dashBtnLbl);
+  lv_obj_add_event_cb(dashBtn, [](lv_event_t *e) {
+    dashboardMode = !dashboardMode;
+    prefs.begin("stock", false);
+    prefs.putBool("dashboard", dashboardMode);
+    prefs.end();
+    if (dashboardMode) pendingEnterDashboard = true;
+    else pendingExitDashboard = true;
+    pendingClosePopup = true;
+  }, LV_EVENT_CLICKED, NULL);
   
   // ===== Stock Rotation Button =====
   lv_obj_t *rotateBtn = lv_btn_create(settingsPopup);
@@ -3583,12 +4019,15 @@ void setup() {
         lvgl_port_unlock();
       }
       timeClient.begin();
+      timeClient.update();
+      applyUsEasternOffset();
       
       // Load rotation settings
       prefs.begin("stock", true);
       rotationEnabled = prefs.getBool("rotate_on", false);
       rotationList = prefs.getString("rotate_list", "");
       rotationIntervalMins = prefs.getInt("rotate_int", 5);
+      dashboardMode = prefs.getBool("dashboard", false);
       prefs.end();
       parseRotationList();
       lastRotationTime = millis();
@@ -3598,6 +4037,9 @@ void setup() {
         currentSymbol = rotationSymbols[0];
         rotationIndex = 0;
       }
+      
+      // If dashboard mode persisted, request UI creation in loop()
+      if (dashboardMode) pendingEnterDashboard = true;
       
       fetchPrice();
       
@@ -3677,6 +4119,74 @@ void loop() {
   
   // P2P network heartbeat (share stock data with other devices)
   p2pTick();
+  
+  // ===== Dashboard (grid) view handling =====
+  if (pendingEnterDashboard || pendingExitDashboard) {
+    if (lvgl_port_lock(50)) {
+      if (pendingEnterDashboard) {
+        pendingEnterDashboard = false;
+        if (!dashboardScreen) createDashboardUI();
+      }
+      if (pendingExitDashboard) {
+        pendingExitDashboard = false;
+        if (dashboardScreen) destroyDashboardUI();
+      }
+      lvgl_port_unlock();
+    }
+  }
+  
+  // Periodic dashboard tile refresh (every 2s) + background symbol fetch
+  if (dashboardMode && dashboardScreen) {
+    uint32_t now = millis();
+    if (now - lastDashboardUpdate > 2000) {
+      lastDashboardUpdate = now;
+      if (lvgl_port_lock(50)) {
+        updateDashboardTiles();
+        lvgl_port_unlock();
+      }
+    }
+    // Round-robin fetch one symbol every ~15s to keep cache fresh
+    uint32_t fetchInterval = isMarketOpen ? 15000 : 120000;
+    if (dashboardTileCount > 0 && (now - lastDashboardFetch) > fetchInterval &&
+        WiFi.status() == WL_CONNECTED && settingsPopup == nullptr) {
+      lastDashboardFetch = now;
+      int idx = dashboardFetchIdx % dashboardTileCount;
+      dashboardFetchIdx = (dashboardFetchIdx + 1) % dashboardTileCount;
+      String sym = dashboardTileSymbols[idx];
+      if (sym.length() > 0) {
+        // Temporarily borrow currentSymbol so prefetch + cache write are tagged correctly
+        String savedSym = currentSymbol;
+        currentSymbol = sym;
+        prefetchStockData(sym);
+        if (prefetchedStock.valid) {
+          // Write to cache without touching the (hidden) single-stock UI
+          CachedStockData nc = {};
+          nc.valid = true;
+          nc.symbol = sym;
+          char pb[24]; snprintf(pb, sizeof(pb), "$%.2f", prefetchedStock.closePrice);
+          nc.priceStr = pb;
+          char xb[24]; snprintf(xb, sizeof(xb), "%+.2f%%", prefetchedStock.pctChange);
+          nc.changeStr = xb;
+          float d = prefetchedStock.closePrice - prefetchedStock.prevClose;
+          char db[24]; snprintf(db, sizeof(db), "%s$%.2f", d >= 0 ? "+" : "-", fabsf(d));
+          nc.dollarChangeStr = db;
+          nc.companyName = prefetchedStock.companyName;
+          nc.low = prefetchedStock.lowPrice;
+          nc.high = prefetchedStock.highPrice;
+          nc.fiftyTwoLow = prefetchedStock.fiftyTwoLow;
+          nc.fiftyTwoHigh = prefetchedStock.fiftyTwoHigh;
+          nc.oneMonthLow = prefetchedStock.oneMonthLow;
+          nc.oneMonthHigh = prefetchedStock.oneMonthHigh;
+          nc.marketOpen = prefetchedStock.marketOpen;
+          nc.fetchTime = millis();
+          cacheSymbolData(nc);
+          appendSparkPoint(sym, prefetchedStock.closePrice);
+          prefetchedStock.valid = false;
+        }
+        currentSymbol = savedSym;
+      }
+    }
+  }
   
   // Process pending actions with proper locking
   if (pendingOpenSettings || pendingClosePopup || pendingOpenWifi || 
@@ -3864,7 +4374,7 @@ void loop() {
   }
   
   // Stock rotation - based on user-selected interval
-  if (rotationEnabled && rotationCount > 1 && settingsPopup == nullptr) {
+  if (rotationEnabled && rotationCount > 1 && settingsPopup == nullptr && !dashboardMode) {
     uint32_t intervalMs = (uint32_t)rotationIntervalMins * 60000;
     if (millis() - lastRotationTime > intervalMs) {
       lastRotationTime = millis();
@@ -3919,6 +4429,9 @@ void loop() {
   static uint32_t lastRebootCheckMs = 0;
   if ((millis() - lastRebootCheckMs) > 60000) {  // Check every minute
     lastRebootCheckMs = millis();
+    // Re-evaluate DST whenever we tick a minute (cheap; only writes on change)
+    timeClient.update();
+    applyUsEasternOffset();
     if (timeClient.isTimeSet()) {
       int hour = timeClient.getHours();
       int minute = timeClient.getMinutes();
