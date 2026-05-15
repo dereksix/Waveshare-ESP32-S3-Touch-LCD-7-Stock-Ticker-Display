@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.1"
+#define FIRMWARE_VERSION "1.10.2"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -716,6 +716,9 @@ int dashboardTileCount = 0;
 String dashboardTileSymbols[20];
 uint32_t lastDashboardUpdate = 0;
 uint32_t lastDashboardFetch = 0;
+uint32_t lastDashboardFallbackFetch = 0;
+int dashboardFallbackIdx = 0;
+bool dashboardTvmEverSucceeded = false;
 int dashboardFetchIdx = 0;
 bool pendingEnterDashboard = false;
 bool pendingExitDashboard = false;
@@ -4347,16 +4350,11 @@ void loop() {
       }
     }
     // Decide refresh cadence:
-    //  - Trader-VM available: 60s when fully populated, 5s while filling cold cache (batch endpoint, no cost)
+    //  - Trader-VM available: 5s ONLY until the first successful batch lands, then 60s
     //  - Otherwise round-robin one symbol every 15s (open) / 120s (closed) via public APIs
     bool tvmOn = traderVmHost.length() > 0;
-    int filled = 0;
-    for (int i = 0; i < dashboardTileCount; i++) {
-      if (findCachedSymbol(dashboardTileSymbols[i])) filled++;
-    }
-    bool coldStart = (filled < dashboardTileCount);
     uint32_t fetchInterval;
-    if (tvmOn) fetchInterval = coldStart ? 5000 : 60000;
+    if (tvmOn) fetchInterval = dashboardTvmEverSucceeded ? 60000 : 5000;
     else       fetchInterval = isMarketOpen ? 15000 : 120000;
 
     if (dashboardTileCount > 0 && (now - lastDashboardFetch) > fetchInterval &&
@@ -4365,7 +4363,8 @@ void loop() {
 
       if (tvmOn) {
         // Batch fetch all tiles in one HTTP call
-        fetchBatchFromTraderVm(dashboardTileSymbols, dashboardTileCount);
+        int updated = fetchBatchFromTraderVm(dashboardTileSymbols, dashboardTileCount);
+        if (updated > 0) dashboardTvmEverSucceeded = true;
       } else {
         // Fallback: round-robin one symbol per tick via public APIs
         int idx = dashboardFetchIdx % dashboardTileCount;
@@ -4401,6 +4400,52 @@ void loop() {
           }
           currentSymbol = savedSym;
         }
+      }
+    }
+
+    // Secondary fallback: if trader-vm is on but some symbols are missing
+    // (e.g. crypto, non-Schwab tickers), round-robin them through public APIs
+    // at a slow cadence so we don't hammer Finnhub.
+    if (tvmOn && (now - lastDashboardFallbackFetch) > 30000 &&
+        WiFi.status() == WL_CONNECTED && settingsPopup == nullptr) {
+      // Build list of missing-symbol indices
+      int missing[20];
+      int missingCount = 0;
+      for (int i = 0; i < dashboardTileCount && missingCount < 20; i++) {
+        if (!findCachedSymbol(dashboardTileSymbols[i])) {
+          missing[missingCount++] = i;
+        }
+      }
+      if (missingCount > 0) {
+        lastDashboardFallbackFetch = now;
+        int pick = missing[dashboardFallbackIdx % missingCount];
+        dashboardFallbackIdx++;
+        String sym = dashboardTileSymbols[pick];
+        dualLog("[DASH] Fallback fetch for missing %s\n", sym.c_str());
+        String savedSym = currentSymbol;
+        currentSymbol = sym;
+        prefetchStockData(sym);
+        if (prefetchedStock.valid) {
+          CachedStockData nc = {};
+          nc.valid = true;
+          nc.symbol = sym;
+          char pb[24]; snprintf(pb, sizeof(pb), "$%.2f", prefetchedStock.closePrice);
+          nc.priceStr = pb;
+          char xb[24]; snprintf(xb, sizeof(xb), "%+.2f%%", prefetchedStock.pctChange);
+          nc.changeStr = xb;
+          float d = prefetchedStock.closePrice - prefetchedStock.prevClose;
+          char db[24]; snprintf(db, sizeof(db), "%s$%.2f", d >= 0 ? "+" : "-", fabsf(d));
+          nc.dollarChangeStr = db;
+          nc.companyName = prefetchedStock.companyName;
+          nc.low = prefetchedStock.lowPrice;
+          nc.high = prefetchedStock.highPrice;
+          nc.marketOpen = prefetchedStock.marketOpen;
+          nc.fetchTime = millis();
+          cacheSymbolData(nc);
+          appendSparkPoint(sym, prefetchedStock.closePrice);
+          prefetchedStock.valid = false;
+        }
+        currentSymbol = savedSym;
       }
     }
   }
