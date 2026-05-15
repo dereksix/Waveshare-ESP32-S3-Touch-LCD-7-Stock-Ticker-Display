@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.3"
+#define FIRMWARE_VERSION "1.10.4"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -2913,10 +2913,6 @@ static void updateOneTile(int idx) {
   lv_obj_set_style_border_color(dashboardTiles[idx], col, 0);
   // Soft glow shadow color matches direction
   lv_obj_set_style_shadow_color(dashboardTiles[idx], col, 0);
-  // Left accent strip
-  if (dashboardTileAccent[idx]) {
-    lv_obj_set_style_bg_color(dashboardTileAccent[idx], col, 0);
-  }
 
   // Sparkline
   lv_obj_t *chart = dashboardTileChart[idx];
@@ -3106,7 +3102,7 @@ void createDashboardUI() {
     lv_obj_set_style_bg_grad_dir(tile, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(tile, lv_color_hex(0x30363D), 0);
-    lv_obj_set_style_border_width(tile, 1, 0);
+    lv_obj_set_style_border_width(tile, 2, 0);
     lv_obj_set_style_radius(tile, 12, 0);
     lv_obj_set_style_pad_all(tile, 10, 0);
     // Soft drop shadow → "floating tile" feel
@@ -3120,18 +3116,6 @@ void createDashboardUI() {
     lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(tile, dashboardTile_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     dashboardTiles[i] = tile;
-
-    // Left accent strip (color reflects up/down)
-    lv_obj_t *accent = lv_obj_create(tile);
-    lv_obj_remove_style_all(accent);
-    lv_obj_set_size(accent, 4, tileH - 24);
-    lv_obj_align(accent, LV_ALIGN_LEFT_MID, -4, 0);
-    lv_obj_set_style_bg_color(accent, lv_color_hex(0x00E676), 0);
-    lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(accent, 2, 0);
-    lv_obj_clear_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(accent, LV_OBJ_FLAG_CLICKABLE);
-    dashboardTileAccent[i] = accent;
 
     // Sparkline GLOW: wider, semi-transparent line drawn first (faux outer glow)
     lv_obj_t *glow = lv_chart_create(tile);
