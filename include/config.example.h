@@ -15,6 +15,12 @@
 // Get your free API key from https://polygon.io/
 #define POLYGON_API_KEY "YOUR_POLYGON_KEY_HERE"
 
+// Trader-VM (optional) - LAN-local Schwab-streaming proxy on your network.
+// When set, this is queried FIRST (Redis-backed, sub-ms, no rate limits).
+// Format: host:port (no scheme, no trailing slash). Empty string disables it.
+// Override at runtime via the device web UI (/tradervm).
+#define TRADER_VM_HOST ""
+
 // P2P Network Configuration (optional - share stock data between devices)
 // This reduces TwelveData API calls by sharing cached data across devices
 // Set up your own P2P registry at: https://github.com/dereksix/stock-ticker-p2p-registry

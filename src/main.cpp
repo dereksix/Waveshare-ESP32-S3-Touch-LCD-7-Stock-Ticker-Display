@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.0"
+#define FIRMWARE_VERSION "1.10.1"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -709,6 +709,7 @@ lv_obj_t *dashboardTiles[20] = {nullptr};
 lv_obj_t *dashboardTileSym[20] = {nullptr};
 lv_obj_t *dashboardTilePrice[20] = {nullptr};
 lv_obj_t *dashboardTilePct[20] = {nullptr};
+lv_obj_t *dashboardTileDollar[20] = {nullptr};
 lv_obj_t *dashboardTileChart[20] = {nullptr};
 lv_chart_series_t *dashboardTileSeries[20] = {nullptr};
 int dashboardTileCount = 0;
@@ -1225,6 +1226,7 @@ int pendingNetworkIndex = -1;
 String apiKey = "";          // TwelveData API key - for company data, 52-week range
 String finnhubApiKey = "";   // Finnhub API key - PRIMARY for quotes (60 calls/min)
 String polygonApiKey = "";   // Polygon API key - FALLBACK for quotes (5 calls/min)
+String traderVmHost = "";    // Optional LAN proxy "host:port"; empty disables
 
 // Tickers
 const char* tickers[] = {"MSFT", "AAPL", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "SPY", "QQQ"};
@@ -1258,6 +1260,143 @@ bool fetchOneMonthRange(const String& symbol, float& outLow, float& outHigh);
 bool fetch52WeekRange(const String& symbol, float& outLow, float& outHigh);
 String fetchCompanyName(const String& symbol);
 void cacheCompanyName(const String& symbol, const String& name);
+
+// ============================================================================
+// TRADER-VM (LAN-local quote source, Redis-backed, no rate limits)
+// ============================================================================
+
+// Helper: extract a price/pct from a JSON quote object using flexible aliases
+static float jsonAnyFloat(JsonVariantConst v, const char* const* keys, int nKeys) {
+  for (int i = 0; i < nKeys; i++) {
+    JsonVariantConst f = v[keys[i]];
+    if (!f.isNull()) {
+      if (f.is<float>() || f.is<double>() || f.is<int>()) return f.as<float>();
+      if (f.is<const char*>()) {
+        float x = atof(f.as<const char*>());
+        if (x != 0.0f) return x;
+      }
+    }
+  }
+  return 0.0f;
+}
+
+// Single-quote variant from trader-vm /api/quotes (no auth)
+// Fills prefetchedStock; returns true on success.
+bool fetchFromTraderVm(const String& symbol) {
+  if (traderVmHost.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = "http://" + traderVmHost + "/api/quotes?symbols=" + symbol;
+  http.begin(url);
+  http.setTimeout(2500);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    dualLog("[TVM] HTTP %d for %s\n", code, symbol.c_str());
+    return false;
+  }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+  JsonVariantConst q = doc["quotes"][symbol];
+  if (q.isNull()) {
+    dualLog("[TVM] No quote for %s\n", symbol.c_str());
+    return false;
+  }
+
+  static const char* priceKeys[] = {"last_price", "mark", "regular_market_last_price", "lastPrice"};
+  static const char* pctKeys[]   = {"net_change_pct", "regular_market_change_pct", "mark_change_pct", "netPercentChange"};
+
+  float price = jsonAnyFloat(q, priceKeys, 4);
+  float pct   = jsonAnyFloat(q, pctKeys, 4);
+  if (price <= 0.0f) {
+    dualLog("[TVM] No price for %s\n", symbol.c_str());
+    return false;
+  }
+  float prevClose = (pct != 0.0f) ? (price / (1.0f + pct / 100.0f)) : price;
+
+  prefetchedStock.symbol = symbol;
+  prefetchedStock.closePrice = price;
+  prefetchedStock.prevClose = prevClose;
+  prefetchedStock.pctChange = pct;
+  prefetchedStock.openPrice = q["open_price"] | (q["openPrice"] | 0.0f);
+  prefetchedStock.highPrice = q["high_price"] | (q["highPrice"] | 0.0f);
+  prefetchedStock.lowPrice  = q["low_price"]  | (q["lowPrice"]  | 0.0f);
+  prefetchedStock.volume    = q["total_volume"] | (q["totalVolume"] | 0.0f);
+  prefetchedStock.companyName = "";
+  prefetchedStock.marketOpen = true;
+  prefetchedStock.fiftyTwoLow = 0.0f;
+  prefetchedStock.fiftyTwoHigh = 0.0f;
+  prefetchedStock.oneMonthLow = 0.0f;
+  prefetchedStock.oneMonthHigh = 0.0f;
+  prefetchedStock.valid = true;
+  dualLog("[TVM] OK %s $%.2f (%+.2f%%)\n", symbol.c_str(), price, pct);
+  return true;
+}
+
+// Batch fetch many symbols in one call. For each symbol with a price returned,
+// updates symbolCache + spark history. Returns number of symbols updated.
+int fetchBatchFromTraderVm(const String* symbols, int n) {
+  if (traderVmHost.length() == 0 || n == 0) return 0;
+  if (WiFi.status() != WL_CONNECTED) return 0;
+
+  String list;
+  for (int i = 0; i < n; i++) {
+    if (i) list += ",";
+    list += symbols[i];
+  }
+  HTTPClient http;
+  String url = "http://" + traderVmHost + "/api/quotes?symbols=" + list;
+  http.begin(url);
+  http.setTimeout(3500);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    dualLog("[TVM] BATCH HTTP %d (%d sym)\n", code, n);
+    return 0;
+  }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return 0;
+  JsonObjectConst quotes = doc["quotes"].as<JsonObjectConst>();
+  if (quotes.isNull()) return 0;
+
+  static const char* priceKeys[] = {"last_price", "mark", "regular_market_last_price", "lastPrice"};
+  static const char* pctKeys[]   = {"net_change_pct", "regular_market_change_pct", "mark_change_pct", "netPercentChange"};
+
+  int updated = 0;
+  for (int i = 0; i < n; i++) {
+    JsonVariantConst q = quotes[symbols[i].c_str()];
+    if (q.isNull()) continue;
+    float price = jsonAnyFloat(q, priceKeys, 4);
+    float pct   = jsonAnyFloat(q, pctKeys, 4);
+    if (price <= 0.0f) continue;
+    float prevClose = (pct != 0.0f) ? (price / (1.0f + pct / 100.0f)) : price;
+    float dollarChange = price - prevClose;
+
+    CachedStockData nc = {};
+    nc.valid = true;
+    nc.symbol = symbols[i];
+    char pb[24]; snprintf(pb, sizeof(pb), "$%.2f", price);
+    nc.priceStr = pb;
+    char xb[24]; snprintf(xb, sizeof(xb), "%+.2f%%", pct);
+    nc.changeStr = xb;
+    char db[24]; snprintf(db, sizeof(db), "%s$%.2f", dollarChange >= 0 ? "+" : "-", fabsf(dollarChange));
+    nc.dollarChangeStr = db;
+    nc.marketOpen = true;
+    nc.fetchTime = millis();
+    cacheSymbolData(nc);
+    appendSparkPoint(symbols[i], price);
+    updated++;
+  }
+  dualLog("[TVM] BATCH %d/%d symbols\n", updated, n);
+  return updated;
+}
 
 // Finnhub API fetch - used as fallback when TwelveData fails or rate-limited
 // Returns true if successful, fills prefetchedStock with data
@@ -1491,6 +1630,23 @@ bool prefetchStockData(const String& symbol) {
     dualLog("[P2P] Miss for %s - trying APIs\n", symbol.c_str());
   }
   #endif
+  
+  // Step 2.5: Try Trader-VM (LAN, no rate limits) BEFORE public APIs
+  if (traderVmHost.length() > 0) {
+    if (fetchFromTraderVm(symbol)) {
+      // Enrich with company name + 52w + 1m (cached, cheap)
+      if (prefetchedStock.companyName.length() == 0) {
+        prefetchedStock.companyName = fetchCompanyName(symbol);
+      }
+      if (prefetchedStock.fiftyTwoLow == 0.0f || prefetchedStock.fiftyTwoHigh == 0.0f) {
+        fetch52WeekRange(symbol, prefetchedStock.fiftyTwoLow, prefetchedStock.fiftyTwoHigh);
+      }
+      if (prefetchedStock.oneMonthLow == 0.0f || prefetchedStock.oneMonthHigh == 0.0f) {
+        fetchOneMonthRange(symbol, prefetchedStock.oneMonthLow, prefetchedStock.oneMonthHigh);
+      }
+      return true;
+    }
+  }
   
   // Step 3: Try Finnhub API first (primary - 60 calls/min)
   if (finnhubApiKey.length() > 0) {
@@ -2711,6 +2867,7 @@ static void updateOneTile(int idx) {
   if (!c || !c->valid) {
     lv_label_set_text(dashboardTilePrice[idx], "--");
     lv_label_set_text(dashboardTilePct[idx], "...");
+    if (dashboardTileDollar[idx]) lv_label_set_text(dashboardTileDollar[idx], "");
     lv_obj_set_style_text_color(dashboardTilePct[idx], lv_color_hex(0x8B949E), 0);
     return;
   }
@@ -2727,11 +2884,26 @@ static void updateOneTile(int idx) {
   float pctVal = pct.toFloat();
   char pctBuf[24];
   const char* arrow = pctVal >= 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN;
-  snprintf(pctBuf, sizeof(pctBuf), "%s %+.2f%%", arrow, pctVal);
+  snprintf(pctBuf, sizeof(pctBuf), "%s%+.2f%%", arrow, pctVal);
   lv_label_set_text(dashboardTilePct[idx], pctBuf);
+
+  // Dollar change row
+  if (dashboardTileDollar[idx]) {
+    String ds = c->dollarChangeStr;
+    if (ds.length() == 0) {
+      // Reconstruct from price + pct if not present
+      float prev = (pctVal != 0.0f) ? (price / (1.0f + pctVal / 100.0f)) : price;
+      float d = price - prev;
+      char db[24]; snprintf(db, sizeof(db), "%s$%.2f", d >= 0 ? "+" : "-", fabsf(d));
+      lv_label_set_text(dashboardTileDollar[idx], db);
+    } else {
+      lv_label_set_text(dashboardTileDollar[idx], ds.c_str());
+    }
+  }
 
   lv_color_t col = pctVal >= 0 ? lv_color_hex(0x00E676) : lv_color_hex(0xFF5252);
   lv_obj_set_style_text_color(dashboardTilePct[idx], col, 0);
+  if (dashboardTileDollar[idx]) lv_obj_set_style_text_color(dashboardTileDollar[idx], col, 0);
   lv_obj_set_style_border_color(dashboardTiles[idx], col, 0);
 
   // Sparkline
@@ -2740,8 +2912,8 @@ static void updateOneTile(int idx) {
   if (chart && ser) {
     float pts[SPARK_POINTS];
     int n = getSparkPoints(sym, pts, SPARK_POINTS);
-    lv_chart_set_point_count(chart, n > 1 ? n : 2);
     if (n >= 2) {
+      lv_chart_set_point_count(chart, n);
       float minV = pts[0], maxV = pts[0];
       for (int i = 1; i < n; i++) {
         if (pts[i] < minV) minV = pts[i];
@@ -2757,7 +2929,6 @@ static void updateOneTile(int idx) {
       lv_obj_clear_flag(chart, LV_OBJ_FLAG_HIDDEN);
       lv_chart_refresh(chart);
     } else {
-      // Not enough data yet
       lv_obj_add_flag(chart, LV_OBJ_FLAG_HIDDEN);
     }
   }
@@ -2796,6 +2967,7 @@ void destroyDashboardUI() {
     dashboardTileSym[i] = nullptr;
     dashboardTilePrice[i] = nullptr;
     dashboardTilePct[i] = nullptr;
+    dashboardTileDollar[i] = nullptr;
     dashboardTileChart[i] = nullptr;
     dashboardTileSeries[i] = nullptr;
     dashboardTileSymbols[i] = "";
@@ -2873,22 +3045,27 @@ void createDashboardUI() {
   int tileH = (gridH - (rows - 1) * gap) / rows;
 
   // Decide font sizes based on tile size
-  const lv_font_t* symFont = &lv_font_montserrat_24;
-  const lv_font_t* priceFont = &lv_font_montserrat_26;
-  const lv_font_t* pctFont = &lv_font_montserrat_16;
+  // Goal: % change ~= ticker symbol size (per user request); $ change one step smaller
+  const lv_font_t* symFont = &lv_font_montserrat_26;
+  const lv_font_t* priceFont = &lv_font_montserrat_30;
+  const lv_font_t* pctFont = &lv_font_montserrat_26;     // same as ticker
+  const lv_font_t* dollarFont = &lv_font_montserrat_16;
   if (tileH < 130) {
-    symFont = &lv_font_montserrat_18;
-    priceFont = &lv_font_montserrat_20;
-    pctFont = &lv_font_montserrat_14;
+    symFont = &lv_font_montserrat_20;
+    priceFont = &lv_font_montserrat_24;
+    pctFont = &lv_font_montserrat_20;
+    dollarFont = &lv_font_montserrat_14;
   }
   if (tileH < 100) {
     symFont = &lv_font_montserrat_16;
     priceFont = &lv_font_montserrat_18;
-    pctFont = &lv_font_montserrat_12;
+    pctFont = &lv_font_montserrat_16;
+    dollarFont = &lv_font_montserrat_12;
   }
-  int sparkH = tileH / 3;
-  if (sparkH < 24) sparkH = 24;
-  if (sparkH > 60) sparkH = 60;
+  // Sparkline takes lower portion of tile
+  int sparkH = (int)(tileH * 0.40);
+  if (sparkH < 30) sparkH = 30;
+  if (sparkH > 80) sparkH = 80;
 
   for (int i = 0; i < n; i++) {
     int r = i / cols;
@@ -2909,6 +3086,24 @@ void createDashboardUI() {
     lv_obj_add_event_cb(tile, dashboardTile_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     dashboardTiles[i] = tile;
 
+    // Sparkline chart (bottom, behind text) — created FIRST so labels render on top
+    lv_obj_t *chart = lv_chart_create(tile);
+    lv_obj_set_size(chart, tileW - 16, sparkH);
+    lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_div_line_count(chart, 0, 0);
+    lv_chart_set_point_count(chart, SPARK_POINTS);
+    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);  // hide point markers
+    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(chart, 0, 0);
+    lv_obj_set_style_pad_all(chart, 0, 0);
+    lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
+    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(chart, LV_OBJ_FLAG_CLICKABLE);     // pass clicks to tile
+    lv_chart_series_t *ser = lv_chart_add_series(chart, lv_color_hex(0x00E676), LV_CHART_AXIS_PRIMARY_Y);
+    dashboardTileChart[i] = chart;
+    dashboardTileSeries[i] = ser;
+
     // Symbol (top-left)
     lv_obj_t *sym = lv_label_create(tile);
     lv_label_set_text(sym, syms[i].c_str());
@@ -2917,38 +3112,30 @@ void createDashboardUI() {
     lv_obj_align(sym, LV_ALIGN_TOP_LEFT, 0, 0);
     dashboardTileSym[i] = sym;
 
-    // % change (top-right)
+    // % change (top-right) — same size as ticker
     lv_obj_t *pct = lv_label_create(tile);
     lv_label_set_text(pct, "...");
     lv_obj_set_style_text_font(pct, pctFont, 0);
     lv_obj_set_style_text_color(pct, lv_color_hex(0x8B949E), 0);
-    lv_obj_align(pct, LV_ALIGN_TOP_RIGHT, 0, 2);
+    lv_obj_align(pct, LV_ALIGN_TOP_RIGHT, 0, 0);
     dashboardTilePct[i] = pct;
 
-    // Price (middle/left)
+    // $ change (under % change, same color)
+    lv_obj_t *dollar = lv_label_create(tile);
+    lv_label_set_text(dollar, "");
+    lv_obj_set_style_text_font(dollar, dollarFont, 0);
+    lv_obj_set_style_text_color(dollar, lv_color_hex(0x8B949E), 0);
+    lv_obj_align(dollar, LV_ALIGN_TOP_RIGHT, 0, lv_font_get_line_height(pctFont) - 2);
+    dashboardTileDollar[i] = dollar;
+
+    // Price (left, just above sparkline)
     lv_obj_t *price = lv_label_create(tile);
     lv_label_set_text(price, "--");
     lv_obj_set_style_text_font(price, priceFont, 0);
     lv_obj_set_style_text_color(price, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(price, LV_ALIGN_LEFT_MID, 0, -sparkH / 4);
+    // Position above the sparkline
+    lv_obj_align(price, LV_ALIGN_BOTTOM_LEFT, 0, -sparkH);
     dashboardTilePrice[i] = price;
-
-    // Sparkline chart (bottom)
-    lv_obj_t *chart = lv_chart_create(tile);
-    lv_obj_set_size(chart, tileW - 16, sparkH);
-    lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_div_line_count(chart, 0, 0);
-    lv_chart_set_point_count(chart, SPARK_POINTS);
-    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(chart, 0, 0);
-    lv_obj_set_style_pad_all(chart, 0, 0);
-    lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-    lv_chart_series_t *ser = lv_chart_add_series(chart, lv_color_hex(0x00E676), LV_CHART_AXIS_PRIMARY_Y);
-    dashboardTileChart[i] = chart;
-    dashboardTileSeries[i] = ser;
   }
 
   // Initial paint from cache
@@ -3963,6 +4150,13 @@ void setup() {
     polygonApiKey = POLYGON_API_KEY;  // Fall back to compiled config
     #endif
   }
+  // Load Trader-VM host - fall back to compiled default
+  traderVmHost = prefs.getString("tradervm", "");
+  if (traderVmHost.length() == 0) {
+    #ifdef TRADER_VM_HOST
+    traderVmHost = TRADER_VM_HOST;
+    #endif
+  }
   prefs.end();
   
   Serial.printf("TwelveData API Key: %s***\n", apiKey.substring(0, 4).c_str());
@@ -4133,6 +4327,13 @@ void loop() {
       }
       lvgl_port_unlock();
     }
+    // After creating dashboard, kick an immediate batch fill if trader-vm is on
+    if (dashboardScreen && traderVmHost.length() > 0 && dashboardTileCount > 0
+        && WiFi.status() == WL_CONNECTED) {
+      fetchBatchFromTraderVm(dashboardTileSymbols, dashboardTileCount);
+      lastDashboardFetch = millis();
+      if (lvgl_port_lock(50)) { updateDashboardTiles(); lvgl_port_unlock(); }
+    }
   }
   
   // Periodic dashboard tile refresh (every 2s) + background symbol fetch
@@ -4145,45 +4346,61 @@ void loop() {
         lvgl_port_unlock();
       }
     }
-    // Round-robin fetch one symbol every ~15s to keep cache fresh
-    uint32_t fetchInterval = isMarketOpen ? 15000 : 120000;
+    // Decide refresh cadence:
+    //  - Trader-VM available: 60s when fully populated, 5s while filling cold cache (batch endpoint, no cost)
+    //  - Otherwise round-robin one symbol every 15s (open) / 120s (closed) via public APIs
+    bool tvmOn = traderVmHost.length() > 0;
+    int filled = 0;
+    for (int i = 0; i < dashboardTileCount; i++) {
+      if (findCachedSymbol(dashboardTileSymbols[i])) filled++;
+    }
+    bool coldStart = (filled < dashboardTileCount);
+    uint32_t fetchInterval;
+    if (tvmOn) fetchInterval = coldStart ? 5000 : 60000;
+    else       fetchInterval = isMarketOpen ? 15000 : 120000;
+
     if (dashboardTileCount > 0 && (now - lastDashboardFetch) > fetchInterval &&
         WiFi.status() == WL_CONNECTED && settingsPopup == nullptr) {
       lastDashboardFetch = now;
-      int idx = dashboardFetchIdx % dashboardTileCount;
-      dashboardFetchIdx = (dashboardFetchIdx + 1) % dashboardTileCount;
-      String sym = dashboardTileSymbols[idx];
-      if (sym.length() > 0) {
-        // Temporarily borrow currentSymbol so prefetch + cache write are tagged correctly
-        String savedSym = currentSymbol;
-        currentSymbol = sym;
-        prefetchStockData(sym);
-        if (prefetchedStock.valid) {
-          // Write to cache without touching the (hidden) single-stock UI
-          CachedStockData nc = {};
-          nc.valid = true;
-          nc.symbol = sym;
-          char pb[24]; snprintf(pb, sizeof(pb), "$%.2f", prefetchedStock.closePrice);
-          nc.priceStr = pb;
-          char xb[24]; snprintf(xb, sizeof(xb), "%+.2f%%", prefetchedStock.pctChange);
-          nc.changeStr = xb;
-          float d = prefetchedStock.closePrice - prefetchedStock.prevClose;
-          char db[24]; snprintf(db, sizeof(db), "%s$%.2f", d >= 0 ? "+" : "-", fabsf(d));
-          nc.dollarChangeStr = db;
-          nc.companyName = prefetchedStock.companyName;
-          nc.low = prefetchedStock.lowPrice;
-          nc.high = prefetchedStock.highPrice;
-          nc.fiftyTwoLow = prefetchedStock.fiftyTwoLow;
-          nc.fiftyTwoHigh = prefetchedStock.fiftyTwoHigh;
-          nc.oneMonthLow = prefetchedStock.oneMonthLow;
-          nc.oneMonthHigh = prefetchedStock.oneMonthHigh;
-          nc.marketOpen = prefetchedStock.marketOpen;
-          nc.fetchTime = millis();
-          cacheSymbolData(nc);
-          appendSparkPoint(sym, prefetchedStock.closePrice);
-          prefetchedStock.valid = false;
+
+      if (tvmOn) {
+        // Batch fetch all tiles in one HTTP call
+        fetchBatchFromTraderVm(dashboardTileSymbols, dashboardTileCount);
+      } else {
+        // Fallback: round-robin one symbol per tick via public APIs
+        int idx = dashboardFetchIdx % dashboardTileCount;
+        dashboardFetchIdx = (dashboardFetchIdx + 1) % dashboardTileCount;
+        String sym = dashboardTileSymbols[idx];
+        if (sym.length() > 0) {
+          String savedSym = currentSymbol;
+          currentSymbol = sym;
+          prefetchStockData(sym);
+          if (prefetchedStock.valid) {
+            CachedStockData nc = {};
+            nc.valid = true;
+            nc.symbol = sym;
+            char pb[24]; snprintf(pb, sizeof(pb), "$%.2f", prefetchedStock.closePrice);
+            nc.priceStr = pb;
+            char xb[24]; snprintf(xb, sizeof(xb), "%+.2f%%", prefetchedStock.pctChange);
+            nc.changeStr = xb;
+            float d = prefetchedStock.closePrice - prefetchedStock.prevClose;
+            char db[24]; snprintf(db, sizeof(db), "%s$%.2f", d >= 0 ? "+" : "-", fabsf(d));
+            nc.dollarChangeStr = db;
+            nc.companyName = prefetchedStock.companyName;
+            nc.low = prefetchedStock.lowPrice;
+            nc.high = prefetchedStock.highPrice;
+            nc.fiftyTwoLow = prefetchedStock.fiftyTwoLow;
+            nc.fiftyTwoHigh = prefetchedStock.fiftyTwoHigh;
+            nc.oneMonthLow = prefetchedStock.oneMonthLow;
+            nc.oneMonthHigh = prefetchedStock.oneMonthHigh;
+            nc.marketOpen = prefetchedStock.marketOpen;
+            nc.fetchTime = millis();
+            cacheSymbolData(nc);
+            appendSparkPoint(sym, prefetchedStock.closePrice);
+            prefetchedStock.valid = false;
+          }
+          currentSymbol = savedSym;
         }
-        currentSymbol = savedSym;
       }
     }
   }
