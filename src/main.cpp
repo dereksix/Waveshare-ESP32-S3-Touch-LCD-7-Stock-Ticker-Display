@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.2"
+#define FIRMWARE_VERSION "1.10.3"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -711,6 +711,9 @@ lv_obj_t *dashboardTilePrice[20] = {nullptr};
 lv_obj_t *dashboardTilePct[20] = {nullptr};
 lv_obj_t *dashboardTileDollar[20] = {nullptr};
 lv_obj_t *dashboardTileChart[20] = {nullptr};
+lv_obj_t *dashboardTileGlow[20] = {nullptr};      // soft halo line under sparkline
+lv_chart_series_t *dashboardTileGlowSer[20] = {nullptr};
+lv_obj_t *dashboardTileAccent[20] = {nullptr};    // left edge color strip
 lv_chart_series_t *dashboardTileSeries[20] = {nullptr};
 int dashboardTileCount = 0;
 String dashboardTileSymbols[20];
@@ -2908,15 +2911,24 @@ static void updateOneTile(int idx) {
   lv_obj_set_style_text_color(dashboardTilePct[idx], col, 0);
   if (dashboardTileDollar[idx]) lv_obj_set_style_text_color(dashboardTileDollar[idx], col, 0);
   lv_obj_set_style_border_color(dashboardTiles[idx], col, 0);
+  // Soft glow shadow color matches direction
+  lv_obj_set_style_shadow_color(dashboardTiles[idx], col, 0);
+  // Left accent strip
+  if (dashboardTileAccent[idx]) {
+    lv_obj_set_style_bg_color(dashboardTileAccent[idx], col, 0);
+  }
 
   // Sparkline
   lv_obj_t *chart = dashboardTileChart[idx];
   lv_chart_series_t *ser = dashboardTileSeries[idx];
+  lv_obj_t *glow = dashboardTileGlow[idx];
+  lv_chart_series_t *gser = dashboardTileGlowSer[idx];
   if (chart && ser) {
     float pts[SPARK_POINTS];
     int n = getSparkPoints(sym, pts, SPARK_POINTS);
     if (n >= 2) {
       lv_chart_set_point_count(chart, n);
+      if (glow) lv_chart_set_point_count(glow, n);
       float minV = pts[0], maxV = pts[0];
       for (int i = 1; i < n; i++) {
         if (pts[i] < minV) minV = pts[i];
@@ -2924,15 +2936,21 @@ static void updateOneTile(int idx) {
       }
       if (maxV - minV < 0.01f) { maxV = minV + 1.0f; }
       lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
+      if (glow) lv_chart_set_range(glow, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
       for (int i = 0; i < n; i++) {
         int v = (int)((pts[i] - minV) / (maxV - minV) * 1000.0f);
         lv_chart_set_value_by_id(chart, ser, i, v);
+        if (glow && gser) lv_chart_set_value_by_id(glow, gser, i, v);
       }
       lv_obj_set_style_line_color(chart, col, LV_PART_ITEMS);
+      if (glow) lv_obj_set_style_line_color(glow, col, LV_PART_ITEMS);
       lv_obj_clear_flag(chart, LV_OBJ_FLAG_HIDDEN);
+      if (glow) lv_obj_clear_flag(glow, LV_OBJ_FLAG_HIDDEN);
       lv_chart_refresh(chart);
+      if (glow) lv_chart_refresh(glow);
     } else {
       lv_obj_add_flag(chart, LV_OBJ_FLAG_HIDDEN);
+      if (glow) lv_obj_add_flag(glow, LV_OBJ_FLAG_HIDDEN);
     }
   }
 }
@@ -2973,6 +2991,9 @@ void destroyDashboardUI() {
     dashboardTileDollar[i] = nullptr;
     dashboardTileChart[i] = nullptr;
     dashboardTileSeries[i] = nullptr;
+    dashboardTileGlow[i] = nullptr;
+    dashboardTileGlowSer[i] = nullptr;
+    dashboardTileAccent[i] = nullptr;
     dashboardTileSymbols[i] = "";
   }
   dashboardTileCount = 0;
@@ -3079,30 +3100,73 @@ void createDashboardUI() {
     lv_obj_t *tile = lv_obj_create(dashboardScreen);
     lv_obj_set_pos(tile, x, y);
     lv_obj_set_size(tile, tileW, tileH);
-    lv_obj_set_style_bg_color(tile, lv_color_hex(0x161B22), 0);
+    // Subtle vertical gradient: lighter top -> darker bottom
+    lv_obj_set_style_bg_color(tile, lv_color_hex(0x1C232E), 0);
+    lv_obj_set_style_bg_grad_color(tile, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_bg_grad_dir(tile, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(tile, lv_color_hex(0x30363D), 0);
-    lv_obj_set_style_border_width(tile, 2, 0);
-    lv_obj_set_style_radius(tile, 10, 0);
-    lv_obj_set_style_pad_all(tile, 6, 0);
+    lv_obj_set_style_border_width(tile, 1, 0);
+    lv_obj_set_style_radius(tile, 12, 0);
+    lv_obj_set_style_pad_all(tile, 10, 0);
+    // Soft drop shadow → "floating tile" feel
+    lv_obj_set_style_shadow_color(tile, lv_color_hex(0x00E676), 0);
+    lv_obj_set_style_shadow_width(tile, 12, 0);
+    lv_obj_set_style_shadow_opa(tile, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_spread(tile, 0, 0);
+    lv_obj_set_style_shadow_ofs_x(tile, 0, 0);
+    lv_obj_set_style_shadow_ofs_y(tile, 2, 0);
     lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(tile, dashboardTile_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     dashboardTiles[i] = tile;
 
-    // Sparkline chart (bottom, behind text) — created FIRST so labels render on top
+    // Left accent strip (color reflects up/down)
+    lv_obj_t *accent = lv_obj_create(tile);
+    lv_obj_remove_style_all(accent);
+    lv_obj_set_size(accent, 4, tileH - 24);
+    lv_obj_align(accent, LV_ALIGN_LEFT_MID, -4, 0);
+    lv_obj_set_style_bg_color(accent, lv_color_hex(0x00E676), 0);
+    lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(accent, 2, 0);
+    lv_obj_clear_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(accent, LV_OBJ_FLAG_CLICKABLE);
+    dashboardTileAccent[i] = accent;
+
+    // Sparkline GLOW: wider, semi-transparent line drawn first (faux outer glow)
+    lv_obj_t *glow = lv_chart_create(tile);
+    lv_obj_set_size(glow, tileW - 28, sparkH);
+    lv_obj_align(glow, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_chart_set_type(glow, LV_CHART_TYPE_LINE);
+    lv_chart_set_div_line_count(glow, 0, 0);
+    lv_chart_set_point_count(glow, SPARK_POINTS);
+    lv_obj_set_style_size(glow, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(glow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(glow, 0, 0);
+    lv_obj_set_style_pad_all(glow, 0, 0);
+    lv_obj_set_style_line_width(glow, 6, LV_PART_ITEMS);
+    lv_obj_set_style_line_opa(glow, LV_OPA_30, LV_PART_ITEMS);
+    lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(glow, LV_OBJ_FLAG_CLICKABLE);
+    lv_chart_series_t *gser = lv_chart_add_series(glow, lv_color_hex(0x00E676), LV_CHART_AXIS_PRIMARY_Y);
+    dashboardTileGlow[i] = glow;
+    dashboardTileGlowSer[i] = gser;
+
+    // Sparkline (sharp line on top of glow)
     lv_obj_t *chart = lv_chart_create(tile);
-    lv_obj_set_size(chart, tileW - 16, sparkH);
-    lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(chart, tileW - 28, sparkH);
+    lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, -2);
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
     lv_chart_set_div_line_count(chart, 0, 0);
     lv_chart_set_point_count(chart, SPARK_POINTS);
-    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);  // hide point markers
+    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(chart, 0, 0);
     lv_obj_set_style_pad_all(chart, 0, 0);
     lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
+    lv_obj_set_style_line_opa(chart, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_CLICKABLE);     // pass clicks to tile
+    lv_obj_clear_flag(chart, LV_OBJ_FLAG_CLICKABLE);
     lv_chart_series_t *ser = lv_chart_add_series(chart, lv_color_hex(0x00E676), LV_CHART_AXIS_PRIMARY_Y);
     dashboardTileChart[i] = chart;
     dashboardTileSeries[i] = ser;
@@ -3136,8 +3200,7 @@ void createDashboardUI() {
     lv_label_set_text(price, "--");
     lv_obj_set_style_text_font(price, priceFont, 0);
     lv_obj_set_style_text_color(price, lv_color_hex(0xFFFFFF), 0);
-    // Position above the sparkline
-    lv_obj_align(price, LV_ALIGN_BOTTOM_LEFT, 0, -sparkH);
+    lv_obj_align(price, LV_ALIGN_BOTTOM_LEFT, 0, -sparkH - 2);
     dashboardTilePrice[i] = price;
   }
 
