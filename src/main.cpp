@@ -5,7 +5,7 @@
 // IMPORTANT: Copy include/config.example.h to include/config.h and add your API key
 // LVGL port runs its own task, so we must use lvgl_port_lock/unlock
 
-#define FIRMWARE_VERSION "1.10.5"
+#define FIRMWARE_VERSION "1.10.6"
 #define LOG_SERVER_IP "10.0.6.33"  // PC IP for WiFi logging
 #define GITHUB_REPO "dereksix/Waveshare-ESP32-S3-Touch-LCD-7-Stock-Ticker-Display"
 
@@ -2229,6 +2229,36 @@ void fetchPrice() {
       lvgl_port_unlock();
     }
     return;
+  }
+
+  // Try Trader-VM first for single-view refreshes too.
+  // This keeps behavior consistent with dashboard mode and avoids public API usage
+  // when local Redis/Schwab cache has the data.
+  if (traderVmHost.length() > 0) {
+    if (fetchFromTraderVm(currentSymbol)) {
+      // Enrich with cached/secondary fields for the main UI widgets
+      if (prefetchedStock.companyName.length() == 0) {
+        prefetchedStock.companyName = fetchCompanyName(currentSymbol);
+      }
+      if (prefetchedStock.fiftyTwoLow == 0.0f || prefetchedStock.fiftyTwoHigh == 0.0f) {
+        fetch52WeekRange(currentSymbol, prefetchedStock.fiftyTwoLow, prefetchedStock.fiftyTwoHigh);
+      }
+      if (prefetchedStock.oneMonthLow == 0.0f || prefetchedStock.oneMonthHigh == 0.0f) {
+        fetchOneMonthRange(currentSymbol, prefetchedStock.oneMonthLow, prefetchedStock.oneMonthHigh);
+      }
+
+      if (lvgl_port_lock(100)) {
+        applyPrefetchedData();
+        lvgl_port_unlock();
+      }
+
+      prefs.begin("stock", false);
+      prefs.putString("symbol", currentSymbol);
+      prefs.putString("price", lastPrice);
+      prefs.end();
+      return;
+    }
+    Serial.printf("[TVM] Failed for %s - trying Finnhub fallback\\n", currentSymbol.c_str());
   }
   
   // Try Finnhub first (primary API - 60 calls/min)
